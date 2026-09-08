@@ -6,6 +6,7 @@
 //! ```
 
 use std::error::Error;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -534,6 +535,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             && let Err(err) = streamer.push(frame)
         {
             stream_error = Some(err.to_string())
+        }
+        // The example always wants the whole utterance; a caller that stops
+        // listening returns `Break` here instead.
+        match &stream_error {
+            Some(_) => ControlFlow::Break(()),
+            None => ControlFlow::Continue(()),
         }
     })?;
     println!();

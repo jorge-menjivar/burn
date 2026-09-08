@@ -25,6 +25,7 @@ use crate::config::{Activation, CodePredictorConfig, Config, Dialect, TalkerConf
 use crate::sampling::{MASKED, Sampling};
 use crate::transformer::{Transformer, TransformerConfig, TransformerState};
 use std::cell::RefCell;
+use std::ops::ControlFlow;
 use std::rc::Rc;
 
 impl CodePredictorConfig {
@@ -1042,12 +1043,17 @@ impl Qwen3Tts {
     /// Generates the codec frames for `prompt`, each frame holding `num_code_groups` codes.
     ///
     /// `on_frame` is called with every generated frame as soon as it is available, which is what
-    /// the streaming mode of the example uses to decode the audio while it is generated.
+    /// the streaming mode of the example uses to decode the audio while it is generated. It
+    /// returns whether to keep generating: [`ControlFlow::Break`] ends the generation after that
+    /// frame and returns the frames produced so far, which is how a caller streaming to a
+    /// listener who has gone away stops paying for the rest of the utterance. There is no other
+    /// way out of the loop — it runs until the end of speech token or `max_new_tokens`, tens of
+    /// seconds of work for a long text.
     pub fn generate_with_callback(
         &mut self,
         prompt: &Prompt,
         config: &GenerationConfig,
-        mut on_frame: impl FnMut(&[u32]),
+        mut on_frame: impl FnMut(&[u32]) -> ControlFlow<()>,
     ) -> Result<Vec<Vec<u32>>, String> {
         let (embeds, trailing, tts_pad) = self.build_prompt(prompt)?;
         let eos = self.config.talker_config.codec_eos_token_id;
@@ -1100,8 +1106,11 @@ impl Qwen3Tts {
                 break;
             }
             generated.push(code0);
-            on_frame(&frame);
+            let keep_going = on_frame(&frame);
             frames.push(frame);
+            if keep_going.is_break() {
+                break;
+            }
             if step + 1 == config.max_new_tokens {
                 break;
             }
