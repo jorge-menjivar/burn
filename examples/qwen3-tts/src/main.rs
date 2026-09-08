@@ -256,7 +256,9 @@ fn hub_file(
 /// Decodes the generated frames as they come and appends the audio to the output file.
 ///
 /// Each chunk is decoded together with the frames that precede it, whose audio is then
-/// discarded, so that the result matches decoding everything at once.
+/// discarded, so that the result matches decoding everything at once, and through a window of
+/// the same length every time, so that the decoder meets one shape per stream, see
+/// [`SpeechTokenizer::decode_window`].
 struct Streamer<'a> {
     speech_tokenizer: &'a mut SpeechTokenizer,
     writer: WavWriter,
@@ -266,7 +268,6 @@ struct Streamer<'a> {
     written: usize,
     chunk: usize,
     left_context: usize,
-    samples_per_frame: usize,
     first_audio: Option<Duration>,
     start: Instant,
 }
@@ -279,7 +280,6 @@ impl<'a> Streamer<'a> {
         left_context: usize,
     ) -> Result<Self, Box<dyn Error>> {
         let sample_rate = speech_tokenizer.output_sample_rate() as u32;
-        let samples_per_frame = speech_tokenizer.samples_per_frame();
         let num_code_groups = speech_tokenizer.num_code_groups();
         Ok(Self {
             speech_tokenizer,
@@ -289,7 +289,6 @@ impl<'a> Streamer<'a> {
             written: 0,
             chunk,
             left_context,
-            samples_per_frame,
             first_audio: None,
             start: Instant::now(),
         })
@@ -312,11 +311,12 @@ impl<'a> Streamer<'a> {
         }
         let context = usize::min(self.left_context, self.written);
         let start = (self.written - context) * self.num_code_groups;
-        let pcm = self
-            .speech_tokenizer
-            .decode_chunk(&self.codes[start..frames * self.num_code_groups]);
-        let skip = context * self.samples_per_frame;
-        self.writer.write(&pcm[skip..])?;
+        let pcm = self.speech_tokenizer.decode_window(
+            &self.codes[start..frames * self.num_code_groups],
+            context,
+            self.left_context + self.chunk,
+        );
+        self.writer.write(&pcm)?;
         self.written = frames;
         if self.first_audio.is_none() {
             self.first_audio = Some(self.start.elapsed())
@@ -337,9 +337,10 @@ impl<'a> Streamer<'a> {
 ///
 /// CubeCL caches the kernels it compiles at runtime next to its autotune results, in
 /// `target/environment` when running from a cargo workspace and in the user cache directory
-/// otherwise. This example needs a few hundred of them, worth about 20 seconds of compilation
-/// spread over the first frames of the generation and the first speech decoding, so the cache is
-/// what makes every run of a build but the first fast.
+/// otherwise. This example needs a few hundred of them, and its autotune decisions compile and
+/// time many more: minutes on a host that has never run it, see the README, spread over the
+/// first frames of the generation and the first speech decoding, so the cache is what makes
+/// every run of a build but the first fast.
 ///
 /// Must run before the first device is created, because the configuration is frozen the first
 /// time something reads it. A `cubecl.toml` or `burn.toml` up the directory tree and the

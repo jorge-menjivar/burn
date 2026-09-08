@@ -555,15 +555,49 @@ impl SpeechTokenizer {
             let end = usize::min(start + chunk_size, num_frames);
             let context = usize::min(left_context, start);
             let chunk = &codes[(start - context) * num_code_groups..end * num_code_groups];
-            let wav = self.decode_chunk(chunk);
-            pcm.extend_from_slice(&wav[context * self.samples_per_frame()..]);
+            let wav = self.decode_window(chunk, context, left_context + chunk_size);
+            pcm.extend_from_slice(&wav);
             start = end;
         }
         pcm
     }
 
-    /// Decodes every frame of `codes` in a single pass. Used by the streaming mode, which
-    /// prepends the frames that precede the chunk itself and drops their audio.
+    /// Decodes the frames of `codes` after its first `context` ones, which are the context
+    /// they are decoded with and whose audio is dropped, through a window of `window` frames:
+    /// the codes are padded on the right with copies of their last frame up to the window, so
+    /// that every chunk of an utterance reaches the decoder with the same shape, the first
+    /// ones with their shorter context and the last one with its few frames included. The
+    /// decoder is causal, so the padding changes nothing in the samples returned. A GPU
+    /// backend compiles and autotunes its kernels per shape, a couple of minutes each on a
+    /// cold cache for this decoder, and one shape means one such cost for any stream.
+    pub fn decode_window(&mut self, codes: &[u32], context: usize, window: usize) -> Vec<f32> {
+        let num_code_groups = self.num_code_groups();
+        let frames = self.num_frames(codes);
+        assert!(
+            context < frames,
+            "a window decodes at least one frame past its context"
+        );
+        assert!(
+            frames <= window,
+            "{frames} frames do not fit a window of {window}"
+        );
+        let samples_per_frame = self.samples_per_frame();
+        let padded;
+        let codes = if frames < window {
+            let tail = codes[(frames - 1) * num_code_groups..].repeat(window - frames);
+            padded = [codes, tail.as_slice()].concat();
+            padded.as_slice()
+        } else {
+            codes
+        };
+        let mut wav = self.decode_chunk(codes);
+        wav.truncate(frames * samples_per_frame);
+        wav.drain(..context * samples_per_frame);
+        wav
+    }
+
+    /// Decodes every frame of `codes` in a single pass, at whatever length they come; see
+    /// [`decode_window`](Self::decode_window) for the variant that keeps one shape.
     pub fn decode_chunk(&mut self, codes: &[u32]) -> Vec<f32> {
         let frames = self.num_frames(codes);
         let codes = self.codes_tensor(codes, frames);
