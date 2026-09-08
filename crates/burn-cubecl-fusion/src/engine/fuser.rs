@@ -82,72 +82,40 @@ impl OperationFuser<FuseTrace> for TraceOperationFuser {
         // Capture state before the fuse attempt so we can log a useful reason
         // if the fuser closes on this op.
         let prev_num_ops = self.num_ops;
+        // The reference output shape may be widened while checking an operation's output, before
+        // the operation itself is accepted. A rejected operation must not leave that behind: the
+        // trace would then be built for a shape only the rejected operation defines, and a plan
+        // caching it is refused for naming a relative shape the stream never assigned.
+        let prev_output_shape = self.current_output_shape.clone();
 
-        match op {
+        let rejected = match op {
             OperationIr::Drop(tensor) => {
                 if self.num_ops == 0 {
-                    self.status = FuserStatus::Closed;
-                    self.log_closed(op, prev_num_ops, "drop on empty fuser");
-                    return;
-                }
-
-                self.fuser.fuser.fuse_dropped(tensor);
-            }
-            OperationIr::BaseFloat(ops) => {
-                if !self.fuse_base(ops) {
-                    self.status = FuserStatus::Closed;
-                    self.log_closed(op, prev_num_ops, "base fuse rejected");
-                    return;
+                    Some("drop on empty fuser")
+                } else {
+                    self.fuser.fuser.fuse_dropped(tensor);
+                    None
                 }
             }
-            OperationIr::BaseInt(ops) => {
-                if !self.fuse_base(ops) {
-                    self.status = FuserStatus::Closed;
-                    self.log_closed(op, prev_num_ops, "base fuse rejected");
-                    return;
-                }
-            }
+            OperationIr::BaseFloat(ops)
+            | OperationIr::BaseInt(ops)
+            | OperationIr::BaseBool(ops) => (!self.fuse_base(ops)).then_some("base fuse rejected"),
             OperationIr::Float(_dtype, ops) => {
-                if !self.fuse_float(ops) {
-                    self.status = FuserStatus::Closed;
-                    self.log_closed(op, prev_num_ops, "float fuse rejected");
-                    return;
-                }
+                (!self.fuse_float(ops)).then_some("float fuse rejected")
             }
-            OperationIr::Int(ops) => {
-                if !self.fuse_int(ops) {
-                    self.status = FuserStatus::Closed;
-                    self.log_closed(op, prev_num_ops, "int fuse rejected");
-                    return;
-                }
+            OperationIr::Int(ops) => (!self.fuse_int(ops)).then_some("int fuse rejected"),
+            OperationIr::NumericFloat(_dtype, ops) | OperationIr::NumericInt(_dtype, ops) => {
+                (!self.fuse_numeric(ops)).then_some("numeric fuse rejected")
             }
-            OperationIr::NumericFloat(_dtype, ops) => {
-                if !self.fuse_numeric(ops) {
-                    self.status = FuserStatus::Closed;
-                    self.log_closed(op, prev_num_ops, "numeric fuse rejected");
-                    return;
-                }
-            }
-            OperationIr::NumericInt(_dtype, ops) => {
-                if !self.fuse_numeric(ops) {
-                    self.status = FuserStatus::Closed;
-                    self.log_closed(op, prev_num_ops, "numeric fuse rejected");
-                    return;
-                }
-            }
-            OperationIr::BaseBool(ops) => {
-                if !self.fuse_base(ops) {
-                    self.status = FuserStatus::Closed;
-                    self.log_closed(op, prev_num_ops, "base fuse rejected");
-                    return;
-                }
-            }
-            _ => {
-                self.status = FuserStatus::Closed;
-                self.log_closed(op, prev_num_ops, "unsupported op variant");
-                return;
-            }
+            _ => Some("unsupported op variant"),
         };
+
+        if let Some(reason) = rejected {
+            self.current_output_shape = prev_output_shape;
+            self.status = FuserStatus::Closed;
+            self.log_closed(op, prev_num_ops, reason);
+            return;
+        }
 
         self.status = FuserStatus::Open;
         self.scoring.register(op);
