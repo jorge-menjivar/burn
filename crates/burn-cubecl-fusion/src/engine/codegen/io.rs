@@ -303,6 +303,22 @@ pub fn read_input_window<C: CubePrimitive>(
     slice.downcast()
 }
 
+/// Reads the line at `index` of the input tensor at `pos`, in the numbering of that tensor's own
+/// buffer, without any bounds check.
+///
+/// Unlike [read_input], the index is not a position in the reference layout: a view over an
+/// operand hands out the line indices its own layout computed, which only coincide with the
+/// reference's when the operand happens to be laid out and vectorized like the reference.
+#[cube]
+pub fn read_input_unchecked<C: CubePrimitive>(
+    inputs: &GlobalArgs,
+    #[comptime] pos: usize,
+    index: usize,
+) -> C {
+    let slice = input_as_slice::<C>(inputs, pos);
+    unsafe { *slice.get_unchecked(index) }
+}
+
 /// Returns the input as a slice.
 #[cube]
 pub fn input_as_slice<C: CubePrimitive>(inputs: &GlobalArgs, #[comptime] pos: usize) -> &[C] {
