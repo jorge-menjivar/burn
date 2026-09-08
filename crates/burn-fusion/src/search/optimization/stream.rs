@@ -410,14 +410,14 @@ enum MergeBlockStep {
 /// chunks are [split](repair_order_split) to break the cycle before giving up on fusion.
 fn repair_order<O>(opt: BlockOptimization<O>, operations: &[OperationIr]) -> BlockOptimization<O> {
     let (strategies, ordering) = match opt.strategy {
-        ExecutionStrategy::Composed(items) => (items, opt.ordering),
+        ExecutionStrategy::Composed(items) => (flatten_composed(items), opt.ordering),
         // A single strategy has nothing to reorder across, but a merge can still leave its ops
         // internally out of stream order — validate, and unfuse in stream order if it's broken.
         single => {
             if ordering_is_valid(&opt.ordering, operations) {
                 return BlockOptimization::new(single, opt.ordering);
             }
-            return unfused_stream_order(opt.ordering);
+            return unfused_stream_order(opt.ordering, "the strategy is not executable as ordered");
         }
     };
 
@@ -442,6 +442,26 @@ fn repair_order<O>(opt: BlockOptimization<O>, operations: &[OperationIr]) -> Blo
     };
 
     assemble(strategies, &chunks, &order, operations)
+}
+
+/// Every strategy of a composition, with nested compositions spliced in.
+///
+/// The re-optimization of the holes hands back one strategy per pass, itself a composition when
+/// the holes it covered were unrelated. Ordered as a single chunk, such a strategy can sit both
+/// upstream and downstream of a fused block — the transpose feeding a matmul and the softmax
+/// consuming it, say — which reads as a cycle and costs the whole segment its fusions. Its parts
+/// are independent strategies executed in sequence, so they order as well apart as together.
+fn flatten_composed<O>(
+    strategies: Vec<Box<ExecutionStrategy<O>>>,
+) -> Vec<Box<ExecutionStrategy<O>>> {
+    let mut flat = Vec::with_capacity(strategies.len());
+    for strategy in strategies {
+        match *strategy {
+            ExecutionStrategy::Composed(items) => flat.extend(flatten_composed(items)),
+            strategy => flat.push(Box::new(strategy)),
+        }
+    }
+    flat
 }
 
 /// Retry [repair_order] with every [Operations](ExecutionStrategy::Operations) chunk split into
@@ -480,6 +500,7 @@ fn repair_order_split<O>(
                 .into_iter()
                 .flat_map(|chunk| chunk.positions)
                 .collect(),
+            "fused chunks depend on each other",
         ),
     }
 }
@@ -504,7 +525,7 @@ fn assemble<O>(
     // chunk-level sort. If the result isn't executable, fall back to running every operation
     // unfused in stream order.
     if !ordering_is_valid(&new_ordering, operations) {
-        return unfused_stream_order(new_ordering);
+        return unfused_stream_order(new_ordering, "a chunk is not executable as ordered");
     }
 
     BlockOptimization::new(ExecutionStrategy::Composed(new_strategies), new_ordering)
@@ -514,10 +535,13 @@ fn assemble<O>(
 ///
 /// This is the last-resort fallback: every fusion in the segment is dropped. Logged so a segment
 /// that silently degrades shows up when investigating fusion regressions.
-fn unfused_stream_order<O>(mut positions: Vec<usize>) -> BlockOptimization<O> {
+fn unfused_stream_order<O>(
+    mut positions: Vec<usize>,
+    reason: &'static str,
+) -> BlockOptimization<O> {
     let num_ops = positions.len();
     log_fusion(FusionLogLevel::Medium, || {
-        format!("[repair] falling back to unfused stream order ({num_ops} ops)")
+        format!("[repair] falling back to unfused stream order ({num_ops} ops): {reason}")
     });
 
     positions.sort_unstable();
