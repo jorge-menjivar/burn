@@ -1,0 +1,37 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "qwen3-tts"
+publish = false
+version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["flex"]
+cpu = ["burn/cpu"]
+cuda = ["burn/cuda"]
+flex = ["burn/flex"]
+metal = ["burn/metal"]
+rocm = ["burn/rocm"]
+vulkan = ["burn/vulkan"]
+wgpu = ["burn/wgpu"]
+
+[dependencies]
+burn = { workspace = true, features = ["default", "cubecl", "extension"] }
+burn-cubecl = { workspace = true, features = ["default"] }
+burn-fusion = { workspace = true, features = ["default"] }
+burn-ir = { workspace = true }
+burn-store = { workspace = true, features = ["std", "safetensors"] }
+cubecl = { workspace = true }
+
+clap = { workspace = true }
+hf-hub = { version = "1.0.0", features = ["blocking"] }
+hound = { workspace = true }
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true, features = ["std"] }
+tokenizers = { version = "0.22.2", default-features = false, features = [
+  "onig",
+  "http",
+] }

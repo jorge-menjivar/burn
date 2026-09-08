@@ -482,6 +482,8 @@ Additional examples:
   `Learner` configured to log metrics and keep training checkpoints.
 - [PyTorch Import Inference](./examples/import-model-weights) : Imports a PyTorch model pre-trained
   on MNIST to perform inference on a sample image with Burn.
+- [Qwen3-TTS](./examples/qwen3-tts) : Runs the Qwen3-TTS text-to-speech model with the pre-trained
+  weights from the Hugging Face hub, writing the generated speech to a wav file.
 - [Text Classification](./examples/text-classification) : Trains a text classification transformer
   model on the AG News or DbPedia dataset. The trained model can then be used to classify a text
   sample.
