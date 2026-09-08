@@ -43,8 +43,22 @@ impl Default for AttentionStrategy {
     }
 }
 
+/// Whether a flash strategy that cannot launch a shape runs the fallback instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Degrade {
+    /// Run the fallback, which any shape can: what a call needs, see [`attention`].
+    ToFallback,
+    /// Surface the error: what an autotune candidate needs. A candidate that degraded would
+    /// be benchmarked on the fallback's kernels and report their time under its own name,
+    /// after paying the fallback's nested matmul autotunes for a shape it cannot run anyway.
+    Never,
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Launch an attention kernel with given strategy
+///
+/// A flash strategy that cannot launch the shape runs the fallback instead; see
+/// [`attention_degrading`] for the reason, and for the tune-time alternative.
 pub fn attention(
     query: CubeTensor,
     key: CubeTensor,
@@ -53,6 +67,31 @@ pub fn attention(
     attn_bias: Option<CubeTensor>,
     options: AttentionModuleOptions,
     strategy: AttentionStrategy,
+) -> Result<CubeTensor, AttentionSetupError> {
+    attention_degrading(
+        query,
+        key,
+        value,
+        mask,
+        attn_bias,
+        options,
+        strategy,
+        Degrade::ToFallback,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Launch an attention kernel with given strategy, handling a flash strategy that cannot
+/// launch the shape as `degrade` says.
+pub fn attention_degrading(
+    query: CubeTensor,
+    key: CubeTensor,
+    value: CubeTensor,
+    mask: Option<CubeTensor>,
+    attn_bias: Option<CubeTensor>,
+    options: AttentionModuleOptions,
+    strategy: AttentionStrategy,
+    degrade: Degrade,
 ) -> Result<CubeTensor, AttentionSetupError> {
     // Resolve the flash launch strategy; the non-flash arms answer directly.
     let flash = match strategy {
@@ -83,10 +122,13 @@ pub fn attention(
     // can't launch degrades to the fallback here, the same way the matmul
     // dispatch degrades a constrained routine to the unit kernel; the fallback
     // (separate kernels, materialized scores) has no such constraint and always
-    // runs. Only an `InvalidConfig` degrades — availability and other errors
+    // runs. Only an `InvalidConfig` degrades, and only when `degrade` allows
+    // it: the tune benchmarks its candidates with `Degrade::Never`, so that a
+    // flash candidate which can't launch the benchmarked shape loses outright
+    // instead of standing in for the fallback. Availability and other errors
     // surface unchanged. `options` is `Copy`; the tensors are cheap handle
     // clones, taken only so the originals survive for the fallback.
-    match flash_attention(
+    let result = flash_attention(
         query.clone(),
         key.clone(),
         value.clone(),
@@ -94,11 +136,12 @@ pub fn attention(
         attn_bias.clone(),
         options,
         flash,
-    ) {
-        Err(AttentionSetupError::InvalidConfig(_)) => Ok(attention_fallback::<CubeBackend>(
-            query, key, value, mask, attn_bias, options,
-        )),
-        other => other,
+    );
+    match (result, degrade) {
+        (Err(AttentionSetupError::InvalidConfig(_)), Degrade::ToFallback) => Ok(
+            attention_fallback::<CubeBackend>(query, key, value, mask, attn_bias, options),
+        ),
+        (result, _) => result,
     }
 }
 
