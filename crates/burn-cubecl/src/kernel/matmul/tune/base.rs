@@ -277,6 +277,15 @@ pub fn matmul_autotune(
         }
 
         // Unit matmuls
+        //
+        // For a small general problem the unit group shares the top batch with the accelerated
+        // group, and a register tile matmul then competes only after the accelerated kernels
+        // and `gemm`. On a tensor-core device it never won a small shape it was benchmarked
+        // on, while compiling it is the most expensive step of the whole set: at the
+        // decode-time shapes of a language model's attention fallback (m = 2, n·k = 256) the
+        // min-tile kernel took 16–24 s per shape to JIT on a host that had never compiled it,
+        // a third of that model's cold start. Without an accelerator the unit kernels keep the
+        // top priority and are tried first, as before.
         for tile_size in [
             TileSizeSelection::MaxTileSize,
             TileSizeSelection::MinTileSize,
@@ -295,14 +304,32 @@ pub fn matmul_autotune(
                     true,
                 ),
             ] {
+                let client_unit = tune_client.clone();
                 set = set.with(
                     Tunable::new(&strategy.to_string(), move |(lhs, rhs, out)| {
                         launch_matmul::<_>(&strategy, lhs, rhs, out)
                             .map_err(|err| format!("{err:?}"))
                     })
-                    .group(&unit, move |key| match double_buf {
-                        false => PRIORITY_MAX,
-                        true => double_buffering_priority(key, PRIORITY_MAX, PRIORITY_HIGH),
+                    .group(&unit, move |key| {
+                        let accelerated = matches!(key.analysis.kind, MatmulKind::General)
+                            && [TileMatmulKind::Cmma, TileMatmulKind::Mma].into_iter().any(
+                                |tile_matmul| {
+                                    tile_matmul_supported(
+                                        &client_unit,
+                                        tile_matmul,
+                                        &key.definition,
+                                    )
+                                },
+                            );
+                        let max = if accelerated {
+                            PRIORITY_HIGH
+                        } else {
+                            PRIORITY_MAX
+                        };
+                        match double_buf {
+                            false => max,
+                            true => double_buffering_priority(key, max, PRIORITY_HIGH),
+                        }
                     }),
                 )
             }

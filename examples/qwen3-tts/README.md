@@ -82,14 +82,22 @@ CubeCL compiles every kernel it meets at runtime, and picks the implementation o
 convolutions, reductions and attention by compiling and timing every candidate it has, once per
 shape it has not met. A run of this example meets a few hundred kernels and, for its first
 prompt, 130 such decisions, and their candidates are what a cold start costs: on a host that
-has never run the example, the first frame comes out after five minutes and the first chunk of
-audio after eight, for a 300-character prompt with `--stream` (measured with the driver's cache
-disabled, `CUDA_CACHE_DISABLE=1`; the generation runs at full speed in between). Most of it is
-a handful of candidates that take 20 to 30 seconds each to compile and then lose: two unit
-matmuls at the tiny shapes of the code predictor's attention, the fallback of the attention
-operation, which tunes matmuls of its own, and the inline PTX variants of the fused matmul.
-The rest is the speech decoder, whose window of frames goes through some thirty convolutions
-and matmuls, each with a decision of its own, at the first chunk.
+has never run the example, the first frame comes out after three minutes and the first chunk
+of audio after six, for a 300-character prompt with `--stream` (measured with the driver's
+cache disabled, `CUDA_CACHE_DISABLE=1`; the generation runs at full speed in between). No
+candidate dominates: the time is the driver generating machine code for a hundred-odd kernels,
+a few seconds each for the double-buffered matmuls of the talker and for the speech decoder,
+whose window of frames goes through some thirty convolutions and matmuls, each with a decision
+of its own, at the first chunk.
+
+It took eight minutes before two changes to the autotune lists of `burn-cubecl` on this branch.
+The register-tile matmul candidates, which compiled for 16 to 24 seconds each at the tiny
+shapes of the code predictor's attention and never won on a tensor-core device, now sit behind
+the accelerated kernels there. And a flash attention candidate that cannot launch a shape now
+loses outright, where it used to run the fallback under its own name and pay the fallback's
+matmul autotunes as its own compile time. On this model no flash attention kernel launches at
+all: their stage must divide the number of queries, which a prompt's token count rarely is a
+multiple of, and every attention runs the fallback, whose score matrix is small here.
 
 Two caches keep the result. CubeCL stores the compiled kernels with the autotune results, in
 `target/environment/default.db` when running from a cargo workspace and in the user cache
@@ -99,8 +107,8 @@ the second, and the autotune results with it. Counted from the launch of the pro
 
 | host | first frame | first audio | 300 frames done |
 |---|---|---|---|
-| never ran the example | 5 min | 8 min | 8 min |
-| tuned, CubeCL's database deleted, driver cache kept | 70 s | 170 s | 174 s |
+| never ran the example | 3 min | 6 min | 6 min |
+| tuned, CubeCL's database deleted, driver cache kept | 66 s | 157 s | 162 s |
 | tuned, binary rebuilt | 9 s | 16 s | 21 s |
 | tuned, same binary | 2.5 s | 3 s | 7 s |
 
@@ -116,9 +124,9 @@ varies from one request to the next:
 
 - The prompt, through the prefill: its text tokens and its whole prefix, each rounded up to a
   power of two. On a tuned host the first prompt of a size class costs 3 to 10 seconds before
-  the first frame, and 65 seconds at 512 tokens (a 1200-character prompt), where the attention
-  fallback candidate tunes two large matmuls of its own; prompts of the same class then cost
-  nothing more.
+  the first frame, and 25 seconds at 512 tokens (a 1200-character prompt), where the attention
+  fallback tunes two large matmuls of its own; prompts of the same class then cost nothing
+  more.
 - Nothing else. The talker's decode step has one shape whatever the capacity of its cache: the
   1200-character prompt, whose cache holds 1024 positions rather than 512, tuned nothing but
   its prefill, and growing the cache during a generation captures the step again but tunes

@@ -5,15 +5,21 @@ use cubek::attention::forward::{
     launch::AttentionAutotuneKey,
 };
 
-use crate::{kernel::autotune_bounds, tensor::CubeTensor};
+use crate::{
+    kernel::{attention::Degrade, autotune_bounds},
+    tensor::CubeTensor,
+};
 
-type Inputs = (
+/// The tunable inputs: the call's tensors and options, and whether a flash strategy that
+/// cannot launch the shape may run the fallback instead.
+pub(super) type Inputs = (
     CubeTensor,
     CubeTensor,
     CubeTensor,
     Option<CubeTensor>,
     Option<CubeTensor>,
     burn_backend::ops::AttentionModuleOptions,
+    Degrade,
 );
 
 type AttentionTunables<Out> = TunableSet<AttentionAutotuneKey, Inputs, Out>;
@@ -30,7 +36,7 @@ pub(super) fn with_attention_bounds<Out: 'static>(
     })
 }
 
-fn cost((query, key, value, mask, _attn_bias, options): &Inputs) -> AttentionCost {
+fn cost((query, key, value, mask, _attn_bias, options, _degrade): &Inputs) -> AttentionCost {
     let query_type = dtype_to_storage_type(query.dtype);
 
     AttentionCost {
