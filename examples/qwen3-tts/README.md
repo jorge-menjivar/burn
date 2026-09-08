@@ -28,7 +28,8 @@ out.wav` to listen to it.
 With `--stream` the audio is decoded and appended to the file while it is generated, rather than
 in one pass at the end. Chunks are decoded together with the `--stream-context` frames that
 precede them, whose audio is then dropped, so that the result matches a single decode of
-everything.
+everything, and through a window of `--stream-context` plus `--stream-chunk` frames every time,
+padded on the right, so that the decoder meets one shape (see the Performance section).
 
 ```bash
 cargo run --release -p qwen3-tts --features cuda -- --speaker ryan --stream \
@@ -75,17 +76,65 @@ pauses the generation while each chunk is decoded: six times the 12.5 frames per
 real time. The candle port of the same model runs at around 58 frames per second on the same
 GPU; the rest of this section is about how the gap was closed and then passed.
 
-### Kernel compilation
+### Kernel compilation and autotuning
 
-CubeCL compiles every kernel it meets at runtime. A run of this example needs a few hundred of
-them, and compiling them takes about 20 seconds, spread over the first frames (which come out at
-5 frames per second instead of 15) and the first decoding of audio (12 seconds instead of 0.2).
-CubeCL keeps the compiled kernels on disk, next to its autotune results, so only the first run of
-a build pays for them: the cache lives in `target/environment/default.db` when running from a
-cargo workspace and in the user cache directory otherwise (`~/.cache/cubecl` on Linux), and a
-rebuilt binary compiles its kernels again. `--no-kernel-cache` compiles them on every run, as
-does a `cubecl.toml` with `[compilation] cache = false` in the working directory or one of its
-parents.
+CubeCL compiles every kernel it meets at runtime, and picks the implementation of its matmuls,
+convolutions, reductions and attention by compiling and timing every candidate it has, once per
+shape it has not met. A run of this example meets a few hundred kernels and, for its first
+prompt, 130 such decisions, and their candidates are what a cold start costs: on a host that
+has never run the example, the first frame comes out after five minutes and the first chunk of
+audio after eight, for a 300-character prompt with `--stream` (measured with the driver's cache
+disabled, `CUDA_CACHE_DISABLE=1`; the generation runs at full speed in between). Most of it is
+a handful of candidates that take 20 to 30 seconds each to compile and then lose: two unit
+matmuls at the tiny shapes of the code predictor's attention, the fallback of the attention
+operation, which tunes matmuls of its own, and the inline PTX variants of the fused matmul.
+The rest is the speech decoder, whose window of frames goes through some thirty convolutions
+and matmuls, each with a decision of its own, at the first chunk.
+
+Two caches keep the result. CubeCL stores the compiled kernels with the autotune results, in
+`target/environment/default.db` when running from a cargo workspace and in the user cache
+directory otherwise (`~/.cache/cubecl` on Linux), and the driver keeps the machine code it
+generates from them in `~/.nv/ComputeCache`. Rebuilding the binary loses the first and keeps
+the second, and the autotune results with it. Counted from the launch of the process:
+
+| host | first frame | first audio | 300 frames done |
+|---|---|---|---|
+| never ran the example | 5 min | 8 min | 8 min |
+| tuned, CubeCL's database deleted, driver cache kept | 70 s | 170 s | 174 s |
+| tuned, binary rebuilt | 9 s | 16 s | 21 s |
+| tuned, same binary | 2.5 s | 3 s | 7 s |
+
+`--no-kernel-cache` compiles the kernels on every run, as does a `cubecl.toml` with
+`[compilation] cache = false` in the working directory or one of its parents, and
+`CUBECL_ENVIRONMENT=<name>` tunes again into another database next to the default one.
+
+### One shape per request, and what a warm-up covers
+
+The decisions are kept per shape, rounded up to a power of two, so a shape the host has not met
+tunes again, before the first frame of the request that brings it or in the middle of it. What
+varies from one request to the next:
+
+- The prompt, through the prefill: its text tokens and its whole prefix, each rounded up to a
+  power of two. On a tuned host the first prompt of a size class costs 3 to 10 seconds before
+  the first frame, and 65 seconds at 512 tokens (a 1200-character prompt), where the attention
+  fallback candidate tunes two large matmuls of its own; prompts of the same class then cost
+  nothing more.
+- Nothing else. The talker's decode step has one shape whatever the capacity of its cache: the
+  1200-character prompt, whose cache holds 1024 positions rather than 512, tuned nothing but
+  its prefill, and growing the cache during a generation captures the step again but tunes
+  nothing. The code predictor's passes are the same for every frame. And the speech decoder
+  reads one window per stream, `--stream-context` plus `--stream-chunk` frames, padded on the
+  right with copies of the last frame, which the causal decoder keeps out of the samples
+  returned (`SpeechTokenizer::decode_window`; padding with zeros instead gives the same samples,
+  bit for bit). Without the window, the first two chunks of a stream, decoded with less
+  context, and the last one, with whatever frames remained, had shapes of their own, tuned at
+  frames 50 and 75 and at the end of the first utterance of each length: a host warmed up on
+  25-frame generations then produced a ten-second utterance at 2.6 frames per second, and the
+  cold start above took ten minutes instead of eight.
+
+A warm-up therefore covers a deployment with one prompt per size class of the prompts it will
+serve, however short the speech: the first frame meets every shape of the code predictor and of
+the talker's step, and the first chunk, padded to the window, every shape of the decoder.
 
 ### Where the time goes
 
