@@ -395,11 +395,16 @@ impl TraceRunner for FusedReduceLaunch<'_> {
             }
         };
 
-        let out_vec_axis = output_vectorization_axis(
-            &inputs.strides_ref(&config_read.ref_layout, config_read.rank),
-            self.reduce.axis,
-            vectorization_mode,
-        );
+        // The reference is an output when the reduce reads nothing global, e.g. a tensor
+        // filled with a constant that got fused in, and it lives with the outputs then.
+        let strides_ref = match &config_read.ref_layout {
+            RefLayout::Concrete(FuseArg::Output(..)) => {
+                outputs.strides_ref(&config_read.ref_layout, config_read.rank)
+            }
+            _ => inputs.strides_ref(&config_read.ref_layout, config_read.rank),
+        };
+        let out_vec_axis =
+            output_vectorization_axis(&strides_ref, self.reduce.axis, vectorization_mode);
 
         let kwargs = ReduceKwArgs {
             client,
