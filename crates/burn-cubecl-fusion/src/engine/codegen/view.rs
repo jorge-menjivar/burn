@@ -2,7 +2,7 @@ use crate::engine::codegen::{DynElem, DynSize, io::set_polyfill_typed};
 
 use super::{
     io::{
-        Transform, global_buffer_len, global_vector_size, input_as_slice, read_input,
+        Transform, global_buffer_len, global_vector_size, input_as_slice, read_input_unchecked,
         read_input_window, ref_buffer_len, ref_len,
     },
     ir::{FuseArg, FuseBlockConfig, GlobalArgs, LayoutInfo, LocalArgs},
@@ -96,6 +96,11 @@ impl<E: CubePrimitive> ViewOperationsExpand<E, Coords1d> for GlobalInputExpand {
         read_masked::expand::<E>(scope, in_bounds, slice, pos, value)
     }
 
+    /// `pos` is a line index in the tensor's own buffer, as computed by the layout of the view
+    /// wrapping this buffer, like for the masked read and the slices. Going through
+    /// [read_input](super::io::read_input) instead would take it for a position in the reference
+    /// layout and remap it, which is only right for an operand that shares the reference's
+    /// layout and vector size.
     #[allow(clippy::too_many_arguments)]
     fn __expand_read_unchecked_method(
         &self,
@@ -103,17 +108,7 @@ impl<E: CubePrimitive> ViewOperationsExpand<E, Coords1d> for GlobalInputExpand {
         pos: NativeExpand<usize>,
     ) -> <E as CubeType>::ExpandType {
         set_polyfill_typed::expand::<E, DynElem, DynSize>(scope);
-        let value = read_input::expand::<E::Scalar, E::Size>(
-            scope,
-            &self.inputs,
-            &self.locals,
-            self.pos,
-            pos,
-            self.layout,
-            &self.config,
-            self.transform.clone(),
-        );
-        E::__expand_cast_from(scope, value)
+        read_input_unchecked::expand::<E>(scope, &self.inputs, self.pos, pos)
     }
 
     #[allow(clippy::too_many_arguments)]
