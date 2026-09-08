@@ -13,7 +13,7 @@ use cubecl::{
 };
 use cubek::reduce::{
     launch::{RoutineStrategy, tune_key::ReduceAutotuneKey},
-    routines::{BlueprintStrategy, unit::UnitStrategy},
+    routines::{BlueprintStrategy, cube::CubeStrategy, plane::PlaneStrategy, unit::UnitStrategy},
 };
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +36,8 @@ pub struct FusedBroadcastedReduceAutotuneKey {
 /// Executes the autotuning process for fused reduction operations.
 ///
 /// This function initializes a local tuner and attempts multiple strategies
-/// (fallback vs. unit strategy) to find the most efficient execution path.
+/// (the fallback, then a unit, a plane or a cube per reduced row) to find the most
+/// efficient execution path.
 pub fn fused_broadcasted_reduce_autotune(
     arg: ReduceBroadcastedOptimizationTuneArg,
     context: &mut Context<CubeFusionHandle>,
@@ -46,6 +47,7 @@ pub fn fused_broadcasted_reduce_autotune(
     let tune_id = CubeTuneId::new(&arg.client, &arg.device);
     let tunables = TUNER.init(&tune_id, || {
         const PRIORITY_MAX: i8 = 2;
+        const PRIORITY_MIN: i8 = 1;
         let mut set = TunableSet::new(create_key, FusionInputGen);
 
         let group = TuneGroup::<FusedBroadcastedReduceAutotuneKey>::new(
@@ -59,16 +61,62 @@ pub fn fused_broadcasted_reduce_autotune(
             tune_fallback,
         ));
 
-        // Specialized unit strategy for fused reductions.
-        set = set.with(
-            Tunable::new("fused_reduce_broadcasted_unit", move |input| {
-                tune_reduce(
-                    input,
-                    &RoutineStrategy::Unit(BlueprintStrategy::Inferred(UnitStrategy)),
-                )
-            })
-            .group(&group, |_| PRIORITY_MAX),
-        );
+        // How each routine fares against the number of rows reduced, as for the fused
+        // reduce: one unit per row wants many rows, one cube per row wants few.
+        enum ReduceProps {
+            GreatWithLowReduceCount,
+            GreatWithHighReduceCount,
+            Balanced,
+        }
+
+        let strategies = [
+            (
+                "fused_reduce_broadcasted_unit",
+                RoutineStrategy::Unit(BlueprintStrategy::Inferred(UnitStrategy)),
+                ReduceProps::GreatWithHighReduceCount,
+            ),
+            (
+                "fused_reduce_broadcasted_plane",
+                RoutineStrategy::Plane(BlueprintStrategy::Inferred(PlaneStrategy {
+                    independent: true,
+                })),
+                ReduceProps::Balanced,
+            ),
+            (
+                "fused_reduce_broadcasted_cube",
+                RoutineStrategy::Cube(BlueprintStrategy::Inferred(CubeStrategy {
+                    // Two steps reduction doesn't work with fuse-on-write, we can't activate plane
+                    // when using the cube algo.
+                    use_planes: false,
+                })),
+                ReduceProps::GreatWithLowReduceCount,
+            ),
+        ];
+
+        for (name, strategy, props) in strategies {
+            let tunable = Tunable::new(name, move |input| tune_reduce(input, &strategy)).group(
+                &group,
+                move |key| match props {
+                    ReduceProps::GreatWithLowReduceCount => {
+                        if key.reduce_key.vector_count < 128 {
+                            PRIORITY_MAX
+                        } else {
+                            PRIORITY_MIN
+                        }
+                    }
+                    ReduceProps::GreatWithHighReduceCount => {
+                        if key.reduce_key.vector_count > 64 {
+                            PRIORITY_MAX
+                        } else {
+                            PRIORITY_MIN
+                        }
+                    }
+                    ReduceProps::Balanced => PRIORITY_MAX,
+                },
+            );
+
+            set = set.with(tunable);
+        }
 
         set
     });

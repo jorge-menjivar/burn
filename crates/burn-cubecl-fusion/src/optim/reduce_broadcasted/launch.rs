@@ -3,14 +3,16 @@ use crate::{
         codegen::ir::{FuseArg, FuseBlockConfig, GlobalArgsLaunch, RefLayout},
         launch::runner::{TraceRunner, Vectorization},
     },
-    optim::reduce_broadcasted::unit::{
-        ElemwiseFuseBlockLaunch, ReduceFuseBlockLaunch, reduce_kernel_broadcasted,
+    optim::{
+        reduce::FusedReduceError,
+        reduce_broadcasted::unit::{
+            ElemwiseFuseBlockLaunch, ReduceFuseBlockLaunch, reduce_kernel_broadcasted,
+        },
     },
 };
 use cubecl::{
     ir::{ElemType, FloatKind},
     prelude::*,
-    server::LaunchError,
 };
 use cubek::reduce::{
     ReduceDtypes, VectorizationMode,
@@ -18,8 +20,8 @@ use cubek::reduce::{
     launch::RoutineStrategy,
     output_vectorization_axis,
     routines::{
-        BlueprintStrategy, GlobalReduceBlueprint, ReduceProblem, ReduceVectorSettings, Routine,
-        unit::{UnitRoutine, UnitStrategy},
+        ReduceProblem, ReduceVectorSettings, Routine, cube::CubeRoutine, plane::PlaneRoutine,
+        unit::UnitRoutine,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -35,14 +37,14 @@ pub struct ReduceBroadcastedFuseBlock {
 pub struct FusedReduceBroadcastedLaunch<'a> {
     blocks: &'a Vec<ReduceBroadcastedFuseBlock>,
     reduce_axis: usize,
-    // TODO: Support multiple strategies.
-    _strategy: RoutineStrategy,
+    /// Which workers reduce a row: a unit, a plane or a cube. The autotuner tries each.
+    strategy: RoutineStrategy,
 }
 
 impl Vectorization for FusedReduceBroadcastedLaunch<'_> {}
 
 impl TraceRunner for FusedReduceBroadcastedLaunch<'_> {
-    type Error = LaunchError;
+    type Error = FusedReduceError;
 
     fn run<'a>(
         &'a self,
@@ -51,7 +53,6 @@ impl TraceRunner for FusedReduceBroadcastedLaunch<'_> {
         outputs: GlobalArgsLaunch,
         configs: &'a [FuseBlockConfig],
     ) -> Result<(), Self::Error> {
-        let routine = UnitRoutine;
         let first_config = &configs[0];
 
         let shape = match &first_config.ref_layout {
@@ -67,36 +68,42 @@ impl TraceRunner for FusedReduceBroadcastedLaunch<'_> {
             .required_address_type()
             .max(outputs.required_address_type());
 
-        let (blueprint, settings) = routine
-            .prepare(
-                client,
-                ReduceProblem {
-                    reduce_len,
-                    reduce_count,
-                    axis: self.reduce_axis,
-                    dtypes: ReduceDtypes {
-                        input: ElemType::Float(FloatKind::F32),
-                        output: ElemType::Float(FloatKind::F32),
-                        accumulation: ElemType::Float(FloatKind::F32),
-                    },
-                    address_type,
-                    // We assume at least one block.
-                    instruction: self.blocks.first().unwrap().op,
-                },
-                ReduceVectorSettings {
-                    vectorization_mode: VectorizationMode::Parallel,
-                    vector_size_input: first_config.width,
-                    vector_size_output: 1,
-                    // Fused-reduce selection is cached per anchored key, so
-                    // the unchecked comptime fast paths are never stable here.
-                    unchecked_fast_paths: false,
-                    // The fused read runs the trace, which may write
-                    // materialized intermediates to global outputs.
-                    fuse_on_read: true,
-                },
-                BlueprintStrategy::Inferred(UnitStrategy),
-            )
-            .unwrap();
+        let problem = ReduceProblem {
+            reduce_len,
+            reduce_count,
+            axis: self.reduce_axis,
+            dtypes: ReduceDtypes {
+                input: ElemType::Float(FloatKind::F32),
+                output: ElemType::Float(FloatKind::F32),
+                accumulation: ElemType::Float(FloatKind::F32),
+            },
+            address_type,
+            // We assume at least one block.
+            instruction: self.blocks.first().unwrap().op,
+        };
+        let vector_settings = ReduceVectorSettings {
+            vectorization_mode: VectorizationMode::Parallel,
+            vector_size_input: first_config.width,
+            vector_size_output: 1,
+            // Fused-reduce selection is cached per anchored key, so
+            // the unchecked comptime fast paths are never stable here.
+            unchecked_fast_paths: false,
+            // The fused read runs the trace, which may write
+            // materialized intermediates to global outputs.
+            fuse_on_read: true,
+        };
+
+        let (blueprint, settings) = match self.strategy.clone() {
+            RoutineStrategy::Unit(strategy) => {
+                UnitRoutine.prepare(client, problem, vector_settings, strategy)?
+            }
+            RoutineStrategy::Plane(strategy) => {
+                PlaneRoutine.prepare(client, problem, vector_settings, strategy)?
+            }
+            RoutineStrategy::Cube(strategy) => {
+                CubeRoutine.prepare(client, problem, vector_settings, strategy)?
+            }
+        };
 
         assert_eq!(blueprint.vectorization_mode, VectorizationMode::Parallel);
 
@@ -110,10 +117,7 @@ impl TraceRunner for FusedReduceBroadcastedLaunch<'_> {
                 configs[index + 1].clone(),
                 block.input.clone(),
                 block.output.clone(),
-                match blueprint.global {
-                    GlobalReduceBlueprint::Unit(bpt) => bpt,
-                    _ => panic!(),
-                },
+                blueprint.global,
             );
             index += 2;
             blocks.push(arg);
@@ -126,13 +130,16 @@ impl TraceRunner for FusedReduceBroadcastedLaunch<'_> {
             false => ComptimeOptionArgs::None,
         };
 
-        let out_vec_axis = output_vectorization_axis(
-            &inputs.strides_ref(&first_config.ref_layout, first_config.rank),
-            self.reduce_axis,
-            VectorizationMode::Parallel,
-        );
-
-        // TODO: Ensure parallel is selected.
+        // The reference is an output when the reduce reads nothing global, e.g. a tensor
+        // filled with a constant that got fused in, and it lives with the outputs then.
+        let strides_ref = match &first_config.ref_layout {
+            RefLayout::Concrete(FuseArg::Output(..)) => {
+                outputs.strides_ref(&first_config.ref_layout, first_config.rank)
+            }
+            _ => inputs.strides_ref(&first_config.ref_layout, first_config.rank),
+        };
+        let out_vec_axis =
+            output_vectorization_axis(&strides_ref, self.reduce_axis, VectorizationMode::Parallel);
 
         unsafe {
             reduce_kernel_broadcasted::launch_unchecked(
@@ -144,6 +151,7 @@ impl TraceRunner for FusedReduceBroadcastedLaunch<'_> {
                 outputs,
                 self.reduce_axis,
                 out_vec_axis,
+                reduce_count,
                 blocks,
                 block_end,
             );
