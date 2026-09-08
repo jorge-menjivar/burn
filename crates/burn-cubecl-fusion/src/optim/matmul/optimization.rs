@@ -7,7 +7,8 @@ use crate::{
         codegen::ir::{FuseArg, FuseBlockConfig, FuseType, GlobalArgsLaunch, RefLayout},
         launch::{
             FuseTraceLauncher, HandleInput, LaunchPlan,
-            runner::{TraceRunner, Vectorization, VectorizationAxis},
+            runner::{TraceRunner, Vectorization, VectorizationAxis, VectorizationHandle},
+            vectorization::{Vect, vectorization_default},
         },
         trace::{FuseTrace, TraceError, TuneOutput},
     },
@@ -18,9 +19,10 @@ use crate::{
     },
 };
 use burn_fusion::stream::Context;
-use burn_ir::BinaryOpIr;
+use burn_ir::{BinaryOpIr, TensorId, TensorIr};
 use cubecl::{
     client::Client,
+    ir::VectorSize,
     std::tensor::{MatrixBatchLayout, matrix_batch_layout},
 };
 use cubek::{
@@ -54,6 +56,7 @@ use cubek::{
     std::MatrixLayout,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Fuse matmul operation followed by elemwise operations into a single kernel.
@@ -241,6 +244,16 @@ pub enum FusedMatmulSelector {
 }
 
 impl FusedMatmulSelector {
+    /// Whether the routine writes its output one element at a time.
+    ///
+    /// The gemm routine reduces `k` across a plane and stores a single element per plane, so
+    /// its output view must have a vector size of one. The fused block writing that output runs
+    /// at the same vector size, which costs nothing here: a routine that writes scalars is only
+    /// picked for matrix-vector products, whose epilogue is a vector.
+    pub fn writes_scalars(&self) -> bool {
+        matches!(self, FusedMatmulSelector::GemmNoStage)
+    }
+
     /// Not efficient, but only called once when initializing the tunables.
     pub fn name(&self) -> String {
         let name = match self {
@@ -360,6 +373,48 @@ impl<'a> Vectorization for FusedMatmulLaunch<'a> {
 
         axis
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn vectorization<'b>(
+        &self,
+        context: &Context<CubeFusionHandle>,
+        vectorizations: &mut BTreeMap<TensorId, Vect>,
+        inputs: impl Iterator<Item = VectorizationHandle<'b>>,
+        outputs: impl Iterator<Item = &'b TensorIr>,
+        reshaped: impl Iterator<Item = (&'b TensorIr, &'b TensorIr, bool)>,
+        swapped: impl Iterator<Item = (&'b TensorIr, &'b TensorIr, bool, &'b (usize, usize))>,
+        vector_sizes: &[VectorSize],
+        max: VectorSize,
+        axis: VectorizationAxis,
+    ) {
+        vectorization_default(
+            vectorizations,
+            inputs,
+            outputs,
+            reshaped,
+            swapped,
+            vector_sizes,
+            &Default::default(),
+            max,
+            &axis,
+        );
+
+        if !self.selector.writes_scalars() {
+            return;
+        }
+
+        // The routine stores one element at a time, so the output and the whole block writing it
+        // run at a vector size of one. The matmul operands keep theirs: the routine reads them on
+        // its own, outside the fused block, and its loads are what the vector size is for.
+        let operands = [self.matmul.op.lhs.id, self.matmul.op.rhs.id]
+            .map(|id| context.tensors.get(&id).expect("matmul operand").id);
+
+        for (id, vect) in vectorizations.iter_mut() {
+            if !operands.contains(id) && matches!(vect, Vect::Aligned(size) if *size > 1) {
+                *vect = Vect::Aligned(1);
+            }
+        }
+    }
 }
 
 impl TraceRunner for FusedMatmulLaunch<'_> {
@@ -436,7 +491,10 @@ impl FusedMatmulLaunch<'_> {
             .required_address_type()
             .max(outputs.required_address_type());
 
-        if vector_sizes.out == 1 && (vector_sizes.lhs > 1 || vector_sizes.rhs > 1) {
+        if vector_sizes.out == 1
+            && (vector_sizes.lhs > 1 || vector_sizes.rhs > 1)
+            && !self.selector.writes_scalars()
+        {
             return Err(FusedMatmulError::InvalidInput(
                 "Output vector size of 1 removes the gain from fusion",
             ));
