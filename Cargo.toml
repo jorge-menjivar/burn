@@ -238,5 +238,14 @@ cubek = { git = "https://github.com/tracel-ai/cubek", default-features = false, 
 # cubecl-zspace = { version = "=0.11.0-pre.3", default-features = false }
 # cubek = { version = "=0.3.0-pre.3", default-features = false }
 
+### Local cubecl (../cubecl, branch `compilation-cache-default`): compilation cache on by default. ###
+# Replaces the git source everywhere, including for cubek, so that only one cubecl gets built.
+[patch."https://github.com/tracel-ai/cubecl"]
+cubecl = { path = "../cubecl/crates/cubecl" }
+cubecl-common = { path = "../cubecl/crates/cubecl-common" }
+cubecl-environment = { path = "../cubecl/crates/cubecl-environment" }
+cubecl-ir = { path = "../cubecl/crates/cubecl-ir" }
+cubecl-zspace = { path = "../cubecl/crates/cubecl-zspace" }
+
 [profile.dev]
 debug = 1 # Speed up compilation time and not necessary.
