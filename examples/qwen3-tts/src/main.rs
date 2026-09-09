@@ -4,6 +4,14 @@
 //! cargo run --release -p qwen3-tts --features cuda -- \
 //!     --text "Hello there, this is a test of text to speech with burn." --speaker ryan
 //! ```
+//!
+//! Voice cloning with a Base model, from a few seconds of speech and their transcript:
+//!
+//! ```bash
+//! cargo run --release -p qwen3-tts --features cuda -- --which 0.6b-base \
+//!     --ref-audio voice.wav --ref-text "What the recording says." \
+//!     --text "Hello there, this is a test of voice cloning with burn."
+//! ```
 
 use std::error::Error;
 use std::ops::ControlFlow;
@@ -16,9 +24,9 @@ use clap::Parser;
 use hf_hub::{HFClientSync, split_id};
 use tokenizers::Tokenizer;
 
-use qwen3_tts::audio::WavWriter;
+use qwen3_tts::audio::{WavWriter, read_wav, resample};
 use qwen3_tts::config::{Config, SpeechTokenizerConfig};
-use qwen3_tts::model::{GenerationConfig, Prompt, Qwen3Tts, Voice};
+use qwen3_tts::model::{GenerationConfig, IclReference, Prompt, Qwen3Tts, Voice};
 use qwen3_tts::sampling::Sampling;
 use qwen3_tts::speech_tokenizer::SpeechTokenizer;
 
@@ -30,6 +38,10 @@ enum Which {
     CustomVoice1_7B,
     #[value(name = "1.7b-voice-design")]
     VoiceDesign1_7B,
+    #[value(name = "0.6b-base")]
+    Base0_6B,
+    #[value(name = "1.7b-base")]
+    Base1_7B,
 }
 
 impl Which {
@@ -38,6 +50,8 @@ impl Which {
             Self::CustomVoice0_6B => "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
             Self::CustomVoice1_7B => "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
             Self::VoiceDesign1_7B => "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+            Self::Base0_6B => "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            Self::Base1_7B => "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         }
     }
 }
@@ -73,14 +87,34 @@ struct Args {
     #[arg(long)]
     instruct: Option<String>,
 
+    /// A wav file with a few seconds of speech to clone the voice from, Base models only.
+    #[arg(long)]
+    ref_audio: Option<String>,
+
+    /// The transcript of --ref-audio. With it the recording is also fed to the talker as an
+    /// in-context example, which follows the voice more closely; without it only the speaker
+    /// embedding is used.
+    #[arg(long)]
+    ref_text: Option<String>,
+
+    /// Also write what the reference audio was turned into, its speaker embedding and its
+    /// codes as a JSON object, to this file. Handy to compare with another implementation.
+    #[arg(long)]
+    ref_file: Option<String>,
+
     /// Print the speakers and languages supported by the model and exit.
     #[arg(long)]
     list_speakers: bool,
 
     /// Feed the text to the talker one token per generated frame rather than putting all of it
-    /// in the prefix. This is about the input text, --stream is about the output audio.
-    #[arg(long)]
+    /// in the prefix, which is what the reference implementation does when cloning a voice.
+    /// This is about the input text, --stream is about the output audio.
+    #[arg(long, conflicts_with = "non_streaming_text")]
     streaming_text: bool,
+
+    /// Put the whole text in the prefix, the default unless cloning a voice.
+    #[arg(long, conflicts_with = "streaming_text")]
+    non_streaming_text: bool,
 
     /// The output file using the wav format.
     #[arg(long, default_value = "out.wav")]
@@ -392,14 +426,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let tokenizer = Tokenizer::from_file(tokenizer_file).map_err(|err| err.to_string())?;
     let config: Config = serde_json::from_slice(&std::fs::read(config_file)?)?;
     let st_config: SpeechTokenizerConfig = serde_json::from_slice(&std::fs::read(st_config_file)?)?;
-    if config.tts_model_type == "base" {
-        return Err(
-            "the Base checkpoints clone a voice from a recording, which needs the speaker \
-             encoder and the codec encoder: neither is part of this example, use a CustomVoice \
-             or a VoiceDesign model"
-                .into(),
-        );
-    }
     let (device, is_gpu) = select_device(args.cpu);
     let dtype = match args.dtype.as_deref() {
         Some("f32") => DType::F32,
@@ -420,8 +446,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.sampling_ops {
         qwen3_tts::sampling::use_kernel(false);
     }
-    // The speech tokenizer always runs in f32, as in the reference implementation.
-    let mut speech_tokenizer = SpeechTokenizer::load(&st_config, &st_weights_file, &device)?;
+    // The speech tokenizer always runs in f32, as in the reference implementation. Its encoder
+    // is only needed to turn the reference recording into the codes of the in-context example.
+    let ref_text = args.ref_text.as_deref().filter(|text| !text.is_empty());
+    let icl_mode = args.ref_audio.is_some() && ref_text.is_some();
+    let mut speech_tokenizer = if icl_mode {
+        SpeechTokenizer::load_with_encoder(&st_config, &st_weights_file, &device)?
+    } else {
+        SpeechTokenizer::load(&st_config, &st_weights_file, &device)?
+    };
     println!("loaded the models in {:?}", start.elapsed());
 
     let speakers = model.supported_speakers();
@@ -432,8 +465,54 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    // Voice cloning: the speaker embedding and the codes of the reference recording.
+    let (speaker_embedding, ref_codes) = match &args.ref_audio {
+        Some(ref_audio) => {
+            if !model.has_speaker_encoder() {
+                return Err(format!(
+                    "the {} model has no speaker encoder, voice cloning needs a Base model",
+                    config.tts_model_type
+                )
+                .into());
+            }
+            let start = Instant::now();
+            let (pcm, sample_rate) = read_wav(ref_audio)?;
+            let target_rate = speech_tokenizer.input_sample_rate() as u32;
+            let pcm = resample(&pcm, sample_rate, target_rate);
+            println!(
+                "reference audio: {:.2}s at {sample_rate} Hz",
+                pcm.len() as f64 / target_rate as f64
+            );
+            let speaker_embedding = model.speaker_embedding(&pcm)?;
+            let ref_codes = if icl_mode {
+                Some(speech_tokenizer.encode(&pcm)?)
+            } else {
+                None
+            };
+            println!("encoded the reference audio in {:?}", start.elapsed());
+            (Some(speaker_embedding), ref_codes)
+        }
+        None => (None, None),
+    };
+    if let (Some(file), Some(embedding)) = (&args.ref_file, &speaker_embedding) {
+        let embedding = embedding
+            .clone()
+            .cast(DType::F32)
+            .into_data()
+            .try_to_vec::<f32>()
+            .map_err(|err| format!("{err:?}"))?;
+        let codes: Vec<&[u32]> = ref_codes
+            .as_deref()
+            .map(|codes| codes.chunks(model.num_code_groups()).collect())
+            .unwrap_or_default();
+        let reference = serde_json::json!({ "speaker_embedding": embedding, "codes": codes });
+        std::fs::write(file, serde_json::to_string(&reference)?)?;
+        println!("wrote the reference embedding and codes to {file}");
+    }
+
     let speaker = match &args.speaker {
         Some(speaker) => Some(speaker.clone()),
+        None if speaker_embedding.is_some() => None,
         None if config.tts_model_type == "custom_voice" => {
             let speaker = if speakers.contains(&"ryan") {
                 "ryan"
@@ -445,9 +524,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         None => None,
     };
-    let voice = match &speaker {
-        Some(speaker) => Voice::Speaker(speaker),
-        None => Voice::None,
+    let voice = match (&speaker, &speaker_embedding) {
+        (Some(speaker), _) => Voice::Speaker(speaker),
+        (None, Some(embedding)) => Voice::Embedding(embedding),
+        (None, None) => Voice::None,
     };
 
     let encode = |text: &str| -> Result<Vec<u32>, Box<dyn Error>> {
@@ -466,6 +546,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("--instruct is not supported by the 0.6B models, ignoring it");
             None
         }
+        Some(_) if args.ref_audio.is_some() => {
+            println!("--instruct is not supported when cloning a voice, ignoring it");
+            None
+        }
         instruct => instruct,
     };
     let instruct_ids = match instruct {
@@ -474,12 +558,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         ))?),
         None => None,
     };
+    let ref_ids = match (ref_text, &ref_codes) {
+        (Some(ref_text), Some(_)) => Some(encode(&format!(
+            "<|im_start|>assistant\n{ref_text}<|im_end|>\n"
+        ))?),
+        _ => None,
+    };
+    let icl = match (&ref_ids, &ref_codes) {
+        (Some(ref_ids), Some(ref_codes)) => Some(IclReference { ref_ids, ref_codes }),
+        _ => None,
+    };
+    // The reference implementation streams the text when cloning a voice and puts it all in
+    // the prefix otherwise.
+    let non_streaming_mode = if args.streaming_text {
+        false
+    } else if args.non_streaming_text {
+        true
+    } else {
+        args.ref_audio.is_none()
+    };
     let prompt = Prompt {
         input_ids: &input_ids,
         instruct_ids: instruct_ids.as_deref(),
         language: Some(&args.language),
         voice,
-        non_streaming_mode: !args.streaming_text,
+        icl,
+        non_streaming_mode,
     };
 
     // Degenerate sampling parameters are turned into greedy decoding rather than being

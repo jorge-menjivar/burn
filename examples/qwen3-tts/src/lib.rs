@@ -10,6 +10,10 @@
 //!   first codebook entry of the next frame,
 //! - the *code predictor*, a small Qwen3 transformer conditioned on the talker hidden state,
 //!   autoregressively predicts the 15 remaining codebook entries of that frame.
+//!
+//! The `Base` checkpoints clone a voice from a recording: the [`speaker_encoder`] turns it into
+//! an embedding the talker is conditioned on, and the speech tokenizer's encoder turns it into
+//! codes the talker continues from, see [`model::Prompt`].
 
 pub mod audio;
 pub mod config;
@@ -24,6 +28,7 @@ pub mod sampling;
     feature = "cpu"
 ))]
 pub mod sampling_kernel;
+pub mod speaker_encoder;
 pub mod speech_tokenizer;
 pub mod transformer;
 
@@ -100,8 +105,8 @@ impl ModuleAdapter for CheckpointAdapter {
 }
 
 /// Turns the outcome of loading a checkpoint into an error unless every parameter of the module
-/// was filled in. Tensors of the file that no parameter claims are expected: the checkpoints
-/// ship the speaker encoder and the codec encoder, which this example does not implement.
+/// was filled in. Tensors of the file that no parameter claims are expected: the codec encoder
+/// is only loaded for voice cloning, and ships more codebooks than the talker uses.
 pub(crate) fn check_apply_result(
     name: &str,
     result: &burn_store::ApplyResult,

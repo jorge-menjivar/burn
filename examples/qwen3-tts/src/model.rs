@@ -1,14 +1,13 @@
 //! The Qwen3-TTS talker and its code predictor.
 //!
-//! Three flavors of checkpoints exist. [`Qwen3Tts`] handles the two that do not need the
-//! speech-tokenizer encoder:
+//! Three flavors of checkpoints exist, all handled by [`Qwen3Tts`]:
 //!
 //! - `CustomVoice`: a set of predefined speakers, see [`Qwen3Tts::supported_speakers`],
 //!   optionally steered with a natural language instruction (1.7B only),
-//! - `VoiceDesign`: the voice is described by a natural language instruction.
-//!
-//! The `Base` checkpoints clone a voice from a recording, which requires the speaker encoder and
-//! the codec encoder; neither is ported here.
+//! - `VoiceDesign`: the voice is described by a natural language instruction,
+//! - `Base`: the voice is cloned from a recording, through its speaker embedding
+//!   ([`Qwen3Tts::speaker_embedding`], [`Voice::Embedding`]) and, for a closer match, its
+//!   transcript and codes fed to the talker as an in-context example ([`IclReference`]).
 //!
 //! Text has to be tokenized with the Qwen2/Qwen3 tokenizer and wrapped in the chat template used
 //! by the reference implementation, see [`Prompt`].
@@ -23,6 +22,7 @@ use burn_store::{FloatCastAdapter, KeyRemapper, ModuleAdapter, ModuleSnapshot, S
 
 use crate::config::{Activation, CodePredictorConfig, Config, Dialect, TalkerConfig};
 use crate::sampling::{MASKED, Sampling};
+use crate::speaker_encoder::{MelConfig, SpeakerEncoder, mel_spectrogram};
 use crate::transformer::{Transformer, TransformerConfig, TransformerState};
 use std::cell::RefCell;
 use std::ops::ControlFlow;
@@ -260,10 +260,12 @@ impl Talker {
 #[derive(Module, Debug)]
 pub struct Model {
     talker: Talker,
+    /// Only the Base checkpoints ship it.
+    speaker_encoder: Option<SpeakerEncoder>,
 }
 
 impl Model {
-    fn init(cfg: &Config, device: &Device) -> Self {
+    fn init(cfg: &Config, device: &Device) -> Result<Self, String> {
         let tc = &cfg.talker_config;
         let talker = Talker {
             model: TalkerBackbone {
@@ -284,18 +286,41 @@ impl Model {
                 .init(device),
             code_predictor: CodePredictor::init(&tc.code_predictor_config, tc.hidden_size, device),
         };
-        Self { talker }
+        let speaker_encoder = cfg
+            .speaker_encoder_config
+            .as_ref()
+            .map(|cfg| SpeakerEncoder::init(cfg, device))
+            .transpose()?;
+        Ok(Self {
+            talker,
+            speaker_encoder,
+        })
     }
 }
 
 /// Speaker conditioning of a prompt.
 #[derive(Debug, Clone, Copy)]
 pub enum Voice<'a> {
-    /// No speaker conditioning, for the VoiceDesign models.
+    /// No speaker conditioning: VoiceDesign models, or Base models without cloning.
     None,
     /// One of the predefined speakers of a CustomVoice model, see
     /// [`Qwen3Tts::supported_speakers`].
     Speaker(&'a str),
+    /// A speaker embedding of shape `(hidden_size,)` for the Base models, see
+    /// [`Qwen3Tts::speaker_embedding`].
+    Embedding(&'a Tensor<1>),
+}
+
+/// In-context voice cloning reference for the Base models: the talker continues a transcript
+/// and the codes of its recording, and keeps the voice.
+#[derive(Debug, Clone, Copy)]
+pub struct IclReference<'a> {
+    /// Tokens of `<|im_start|>assistant\n{reference transcript}<|im_end|>\n`.
+    pub ref_ids: &'a [u32],
+    /// The codes of the reference recording, laid out frame by frame with `num_code_groups`
+    /// per frame, as [`SpeechTokenizer::encode`](crate::speech_tokenizer::SpeechTokenizer::encode)
+    /// returns them.
+    pub ref_codes: &'a [u32],
 }
 
 /// Inputs of one text-to-speech request.
@@ -312,8 +337,11 @@ pub struct Prompt<'a> {
     /// One of [`Qwen3Tts::supported_languages`], `None` or `"auto"` for automatic detection.
     pub language: Option<&'a str>,
     pub voice: Voice<'a>,
+    /// The in-context example of a voice clone, Base models only.
+    pub icl: Option<IclReference<'a>>,
     /// With `non_streaming_mode` the whole text is part of the prefix. Otherwise only its
-    /// first token is and the rest is fed one token per generated frame.
+    /// first token is and the rest is fed one token per generated frame, which is how the
+    /// reference implementation runs voice cloning.
     pub non_streaming_mode: bool,
 }
 
@@ -500,14 +528,23 @@ impl Qwen3Tts {
                 cfg.talker_config.vocab_size, cfg.talker_config.codec_eos_token_id
             ));
         }
-        let mut model = Model::init(cfg, device);
+        let mut model = Model::init(cfg, device)?;
         let mut store = SafetensorsStore::from_file(weights)
             .with_from_adapter(crate::CheckpointAdapter.chain(FloatCastAdapter::to(dtype)))
-            .remap(remapper()?)
+            .remap(remapper(cfg)?)
             .allow_partial(true);
-        let result = model
+        let mut result = model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load {}: {err}", weights.display()))?;
+        // The configuration announces the speaker encoder; a checkpoint without any of its
+        // weights loads without it, and simply cannot clone.
+        let speaker_encoder = |path: &str| path.starts_with("speaker_encoder.");
+        if model.speaker_encoder.is_some()
+            && !result.applied.iter().any(|path| speaker_encoder(path))
+        {
+            model.speaker_encoder = None;
+            result.missing.retain(|(path, _)| !speaker_encoder(path));
+        }
         crate::check_apply_result("talker", &result)?;
         Ok(Self {
             talker_state: TransformerState::new(
@@ -819,6 +856,36 @@ impl Qwen3Tts {
         self.config.talker_config.num_code_groups
     }
 
+    /// Whether the checkpoint clones voices, through [`speaker_embedding`](Self::speaker_embedding).
+    pub fn has_speaker_encoder(&self) -> bool {
+        self.model.speaker_encoder.is_some()
+    }
+
+    /// The speaker embedding of a mono recording sampled at 24 kHz, `(hidden_size,)` in the
+    /// talker's dtype, to use as [`Voice::Embedding`]. Base models only.
+    pub fn speaker_embedding(&self, samples: &[f32]) -> Result<Tensor<1>, String> {
+        let (Some(encoder), Some(cfg)) = (
+            &self.model.speaker_encoder,
+            &self.config.speaker_encoder_config,
+        ) else {
+            return Err(
+                "this checkpoint has no speaker encoder, voice cloning needs a Base model"
+                    .to_string(),
+            );
+        };
+        let mel_cfg = MelConfig {
+            sample_rate: cfg.sample_rate,
+            ..Default::default()
+        };
+        let (mels, frames) = mel_spectrogram(samples, &mel_cfg)?;
+        let mels = Tensor::<3>::from_data(
+            TensorData::new(mels, [1, frames, mel_cfg.num_mels]),
+            &self.device,
+        )
+        .cast(self.dtype);
+        Ok(encoder.forward(mels).squeeze_dim(0))
+    }
+
     /// Names of the predefined speakers, empty for models without any.
     pub fn supported_speakers(&self) -> Vec<&str> {
         let mut speakers: Vec<_> = self
@@ -869,6 +936,32 @@ impl Qwen3Tts {
             .forward(self.ids_tensor(ids))
     }
 
+    /// The sum of the embeddings of every codebook of `codes`, laid out frame by frame with
+    /// `num_code_groups` per frame: (1, frames, hidden_size). Codebook 0 uses the talker's
+    /// table, the others the code predictor's.
+    fn frames_embed(&self, codes: &[u32]) -> Result<Tensor<3>, String> {
+        let groups = self.num_code_groups();
+        if codes.is_empty() || !codes.len().is_multiple_of(groups) {
+            return Err(format!(
+                "expected a non-empty multiple of {groups} reference codes, got {}",
+                codes.len()
+            ));
+        }
+        let column = |group: usize| -> Vec<u32> {
+            codes.iter().skip(group).step_by(groups).copied().collect()
+        };
+        let talker = &self.model.talker;
+        let mut acc = talker
+            .model
+            .codec_embedding
+            .forward(self.ids_tensor(&column(0)));
+        for group in 1..groups {
+            let table = &talker.code_predictor.model.codec_embedding[group - 1];
+            acc = acc + table.forward(self.ids_tensor(&column(group)));
+        }
+        Ok(acc)
+    }
+
     fn speaker_embed(&self, voice: Voice) -> Result<Option<Tensor<3>>, String> {
         match voice {
             Voice::None => Ok(None),
@@ -881,6 +974,20 @@ impl Qwen3Tts {
                         self.supported_speakers()
                     )),
                 }
+            }
+            Voice::Embedding(embedding) => {
+                let hidden_size = self.config.talker_config.hidden_size;
+                let [size] = embedding.dims();
+                if size != hidden_size {
+                    return Err(format!(
+                        "the speaker embedding has {size} values, the talker expects {hidden_size}"
+                    ));
+                }
+                Ok(Some(embedding.clone().cast(self.dtype).reshape([
+                    1,
+                    1,
+                    hidden_size,
+                ])))
             }
         }
     }
@@ -987,17 +1094,54 @@ impl Qwen3Tts {
 
         let codec_pad = self.codec_embed(&[tc.codec_pad_id]);
         let codec_bos = codec_input.narrow(1, k - 1, 1);
-        let trailing = if prompt.non_streaming_mode {
-            let text = Tensor::cat(vec![self.text_embed(text_ids), tts_eos], 1) + codec_pad;
-            embeds.push(text);
-            embeds.push(tts_pad.clone() + codec_bos);
-            tts_pad.clone()
-        } else {
-            embeds.push(self.text_embed(&text_ids[..1]) + codec_bos);
-            if text_ids.len() > 1 {
-                Tensor::cat(vec![self.text_embed(&text_ids[1..]), tts_eos], 1)
-            } else {
-                tts_eos
+        let trailing = match prompt.icl {
+            Some(icl) => {
+                // <|im_start|>assistant\n {reference transcript} <|im_end|>\n
+                let m = icl.ref_ids.len();
+                if m < 5 {
+                    return Err(format!(
+                        "ref_ids is too short ({m}), it must follow the chat template"
+                    ));
+                }
+                // The talker reads the reference transcript then the text, over the reference
+                // codes: it continues the recording with the text, in the same voice.
+                let mut ids = icl.ref_ids[3..m - 2].to_vec();
+                ids.extend_from_slice(text_ids);
+                let text_embed = Tensor::cat(vec![self.text_embed(&ids), tts_eos], 1);
+                let codec_embed =
+                    Tensor::cat(vec![codec_bos, self.frames_embed(icl.ref_codes)?], 1);
+                let text_len = text_embed.dims()[1];
+                let codec_len = codec_embed.dims()[1];
+                if prompt.non_streaming_mode {
+                    let text = text_embed + codec_pad;
+                    let codec = codec_embed + tts_pad.clone();
+                    embeds.push(Tensor::cat(vec![text, codec], 1));
+                    tts_pad.clone()
+                } else if text_len > codec_len {
+                    embeds.push(text_embed.clone().narrow(1, 0, codec_len) + codec_embed);
+                    text_embed.narrow(1, codec_len, text_len - codec_len)
+                } else {
+                    let padding = tts_pad
+                        .clone()
+                        .expand([1, codec_len - text_len, hidden_size]);
+                    let text_embed = Tensor::cat(vec![text_embed, padding], 1);
+                    embeds.push(text_embed + codec_embed);
+                    tts_pad.clone()
+                }
+            }
+            None if prompt.non_streaming_mode => {
+                let text = Tensor::cat(vec![self.text_embed(text_ids), tts_eos], 1) + codec_pad;
+                embeds.push(text);
+                embeds.push(tts_pad.clone() + codec_bos);
+                tts_pad.clone()
+            }
+            None => {
+                embeds.push(self.text_embed(&text_ids[..1]) + codec_bos);
+                if text_ids.len() > 1 {
+                    Tensor::cat(vec![self.text_embed(&text_ids[1..]), tts_eos], 1)
+                } else {
+                    tts_eos
+                }
             }
         };
         parts.push(Tensor::cat(embeds, 1));
@@ -1157,18 +1301,32 @@ fn ids_tensor(ids: &[u32], device: &Device) -> Tensor<2, Int> {
     Tensor::<2, Int>::from_data(TensorData::new(ids, [1, len]), device)
 }
 
-/// Maps the names of the checkpoint onto the module tree above. Only the two stacks that hold
-/// their layers next to an embedding table have to move.
-fn remapper() -> Result<KeyRemapper, String> {
-    KeyRemapper::from_patterns(vec![
+/// Maps the names of the checkpoint onto the module tree above: the two stacks that hold their
+/// layers next to an embedding table move, and the speaker encoder's first block, a plain
+/// convolution where the others are SE-Res2Net blocks, leaves their list.
+fn remapper(cfg: &Config) -> Result<KeyRemapper, String> {
+    let mut patterns = vec![
         (
-            r"^talker\.model\.(layers|norm)\.",
-            "talker.model.transformer.$1.",
+            r"^talker\.model\.(layers|norm)\.".to_string(),
+            "talker.model.transformer.$1.".to_string(),
         ),
         (
-            r"^talker\.code_predictor\.model\.(layers|norm)\.",
-            "talker.code_predictor.model.transformer.$1.",
+            r"^talker\.code_predictor\.model\.(layers|norm)\.".to_string(),
+            "talker.code_predictor.model.transformer.$1.".to_string(),
         ),
-    ])
-    .map_err(|err| format!("invalid remapping: {err}"))
+        (
+            r"^speaker_encoder\.blocks\.0\.".to_string(),
+            "speaker_encoder.first.".to_string(),
+        ),
+    ];
+    if let Some(sc) = &cfg.speaker_encoder_config {
+        // Each pattern is applied once, in this order, so the shifts do not chain.
+        for i in 1..sc.enc_channels.len().saturating_sub(1) {
+            patterns.push((
+                format!(r"^speaker_encoder\.blocks\.{i}\."),
+                format!("speaker_encoder.blocks.{}.", i - 1),
+            ));
+        }
+    }
+    KeyRemapper::from_patterns(patterns).map_err(|err| format!("invalid remapping: {err}"))
 }

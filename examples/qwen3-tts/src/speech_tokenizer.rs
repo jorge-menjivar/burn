@@ -5,19 +5,24 @@
 //! ConvNeXt upsampling stages and a SnakeBeta/transposed convolution vocoder (each frame yields
 //! 1920 samples).
 //!
-//! The encoder, which is only needed to compute the codes of a reference recording for voice
-//! cloning, is not ported here.
+//! The encoder is the Mimi encoder of Kyutai as `transformers` packages it (`MimiModel`): a
+//! SEANet convolutional stack, a transformer, a downsampling convolution and a split residual
+//! vector quantizer. It is only needed to compute the codes of a reference recording for voice
+//! cloning, see [`SpeechTokenizer::encode`].
 
 use burn::module::Param;
 use burn::nn::conv::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig};
 use burn::nn::{LayerNorm, LayerNormConfig, Linear};
 use burn::prelude::*;
-use burn::tensor::activation::gelu;
+use burn::tensor::activation::{elu, gelu};
 use burn::tensor::ops::PadMode;
 use burn_store::{KeyRemapper, ModuleSnapshot, SafetensorsStore};
 
-use crate::config::{DecoderConfig, SpeechTokenizerConfig};
-use crate::transformer::{Transformer, TransformerConfig, TransformerState};
+use crate::config::{DecoderConfig, EncoderConfig, SpeechTokenizerConfig};
+use crate::transformer::{
+    Attention, KvCache, LayerScale, RotarySlice, Step, Transformer, TransformerConfig,
+    TransformerState,
+};
 
 impl DecoderConfig {
     fn transformer_config(&self) -> TransformerConfig {
@@ -48,13 +53,17 @@ fn extra_padding(len: usize, kernel_size: usize, padding_total: usize, stride: u
     (ideal_len - len as i64).max(0) as usize
 }
 
-/// Conv1d with causal (left) zero padding, matching `Qwen3TTSTokenizerV2CausalConvNet`.
+/// Conv1d with causal (left) padding, matching `Qwen3TTSTokenizerV2CausalConvNet` and the
+/// `MimiConv1d` of the encoder: zeros, or copies of the edge samples for the encoder's
+/// downsampling convolution.
 #[derive(Module, Debug)]
 struct CausalConv1d {
     conv: Conv1d,
     kernel_size: usize,
     stride: usize,
     padding: usize,
+    #[module(skip)]
+    edge_padding: bool,
 }
 
 impl CausalConv1d {
@@ -67,25 +76,34 @@ impl CausalConv1d {
         groups: usize,
         device: &Device,
     ) -> Self {
-        let conv = Conv1dConfig::new(in_c, out_c, kernel_size)
+        let config = Conv1dConfig::new(in_c, out_c, kernel_size)
             .with_stride(stride)
             .with_dilation(dilation)
-            .with_groups(groups)
-            .init(device);
-        let kernel_size = (kernel_size - 1) * dilation + 1;
+            .with_groups(groups);
+        Self::from_config(config, false, device)
+    }
+
+    /// `edge_padding` fills the padding with the edge samples rather than with zeros.
+    fn from_config(config: Conv1dConfig, edge_padding: bool, device: &Device) -> Self {
+        let kernel_size = (config.kernel_size - 1) * config.dilation + 1;
         Self {
-            conv,
             kernel_size,
-            stride,
-            padding: kernel_size - stride,
+            stride: config.stride,
+            padding: kernel_size - config.stride,
+            edge_padding,
+            conv: config.init(device),
         }
     }
 
     fn forward(&self, xs: Tensor<3>) -> Tensor<3> {
         let len = xs.dims()[2];
         let extra = extra_padding(len, self.kernel_size, self.padding, self.stride);
-        let xs = xs.pad([(self.padding, extra)], PadMode::Constant(0.));
-        self.conv.forward(xs)
+        let mode = if self.edge_padding {
+            PadMode::Edge
+        } else {
+            PadMode::Constant(0.)
+        };
+        self.conv.forward(xs.pad([(self.padding, extra)], mode))
     }
 }
 
@@ -254,6 +272,19 @@ impl Codebook {
             .clamp_min(1e-5)
             .unsqueeze_dim::<2>(1);
         embedding_sum / cluster_usage
+    }
+
+    /// Every entry of the codebook, `codebook_size` rows of `dim`, on the host.
+    fn entries(&self) -> Vec<f32> {
+        let cluster_usage = self
+            .cluster_usage
+            .val()
+            .clamp_min(1e-5)
+            .unsqueeze_dim::<2>(1);
+        (self.embedding_sum.val() / cluster_usage)
+            .into_data()
+            .try_to_vec::<f32>()
+            .expect("the codebooks are f32")
     }
 }
 
@@ -480,17 +511,473 @@ impl Decoder {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The encoder.
+// ---------------------------------------------------------------------------------------------
+
+impl EncoderConfig {
+    /// What the attention layers of the encoder transformer share with the Qwen3 stacks.
+    fn transformer_config(&self) -> TransformerConfig {
+        TransformerConfig {
+            hidden_size: self.hidden_size,
+            intermediate_size: self.intermediate_size,
+            num_hidden_layers: self.num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            num_key_value_heads: self.num_key_value_heads,
+            head_dim: self.head_dim(),
+            rms_norm_eps: self.norm_eps,
+            rope_theta: self.rope_theta,
+            max_position_embeddings: self.max_position_embeddings,
+            hidden_act: self.hidden_act,
+            attention_bias: self.attention_bias,
+            qk_norm: false,
+            layer_scale: true,
+            sliding_window: self.sliding_window,
+        }
+    }
+}
+
+/// A residual unit of the SEANet encoder: two causal convolutions, each preceded by an ELU,
+/// around a skip connection.
+#[derive(Module, Debug)]
+struct SeaNetResidual {
+    conv1: CausalConv1d,
+    conv2: CausalConv1d,
+}
+
+impl SeaNetResidual {
+    fn init(cfg: &EncoderConfig, dim: usize, dilation: usize, device: &Device) -> Self {
+        let hidden = dim / cfg.compress;
+        Self {
+            conv1: CausalConv1d::init(
+                dim,
+                hidden,
+                cfg.residual_kernel_size,
+                dilation,
+                1,
+                1,
+                device,
+            ),
+            conv2: CausalConv1d::init(hidden, dim, 1, 1, 1, 1, device),
+        }
+    }
+
+    fn forward(&self, xs: Tensor<3>) -> Tensor<3> {
+        let hidden = self.conv1.forward(elu(xs.clone(), 1.));
+        xs + self.conv2.forward(elu(hidden, 1.))
+    }
+}
+
+/// A stage of the SEANet encoder: residual units, then an ELU and a strided convolution that
+/// doubles the channels while dividing the length by its stride.
+#[derive(Module, Debug)]
+struct SeaNetStage {
+    residuals: Vec<SeaNetResidual>,
+    downsample: CausalConv1d,
+}
+
+impl SeaNetStage {
+    fn init(cfg: &EncoderConfig, dim: usize, ratio: usize, device: &Device) -> Self {
+        Self {
+            residuals: (0..cfg.num_residual_layers)
+                .map(|j| {
+                    let dilation = cfg.dilation_growth_rate.pow(j as u32);
+                    SeaNetResidual::init(cfg, dim, dilation, device)
+                })
+                .collect(),
+            downsample: CausalConv1d::init(dim, 2 * dim, 2 * ratio, 1, ratio, 1, device),
+        }
+    }
+
+    fn forward(&self, xs: Tensor<3>) -> Tensor<3> {
+        let mut xs = xs;
+        for residual in self.residuals.iter() {
+            xs = residual.forward(xs);
+        }
+        self.downsample.forward(elu(xs, 1.))
+    }
+}
+
+/// The SEANet convolutional stack: 24 kHz samples (B, 1, samples) to 25 Hz latents
+/// (B, hidden_size, frames).
+#[derive(Module, Debug)]
+struct SeaNetEncoder {
+    init_conv: CausalConv1d,
+    stages: Vec<SeaNetStage>,
+    final_conv: CausalConv1d,
+}
+
+impl SeaNetEncoder {
+    fn init(cfg: &EncoderConfig, device: &Device) -> Self {
+        let mut dim = cfg.num_filters;
+        let mut stages = Vec::with_capacity(cfg.upsampling_ratios.len());
+        // The strides are listed for the decoder, the encoder walks them backwards.
+        for &ratio in cfg.upsampling_ratios.iter().rev() {
+            stages.push(SeaNetStage::init(cfg, dim, ratio, device));
+            dim *= 2;
+        }
+        Self {
+            init_conv: CausalConv1d::init(
+                cfg.audio_channels,
+                cfg.num_filters,
+                cfg.kernel_size,
+                1,
+                1,
+                1,
+                device,
+            ),
+            stages,
+            final_conv: CausalConv1d::init(
+                dim,
+                cfg.hidden_size,
+                cfg.last_kernel_size,
+                1,
+                1,
+                1,
+                device,
+            ),
+        }
+    }
+
+    fn forward(&self, xs: Tensor<3>) -> Tensor<3> {
+        let mut xs = self.init_conv.forward(xs);
+        for stage in self.stages.iter() {
+            xs = stage.forward(xs);
+        }
+        self.final_conv.forward(elu(xs, 1.))
+    }
+}
+
+/// The feed-forward block of the encoder transformer: two linear layers around the activation,
+/// without gating or biases.
+#[derive(Module, Debug)]
+struct EncoderMlp {
+    fc1: Linear,
+    fc2: Linear,
+    #[module(skip)]
+    act: crate::config::Activation,
+}
+
+impl EncoderMlp {
+    fn init(cfg: &EncoderConfig, device: &Device) -> Self {
+        let linear = |d_in, d_out| {
+            crate::linear_config(d_in, d_out)
+                .with_bias(false)
+                .init(device)
+        };
+        Self {
+            fc1: linear(cfg.hidden_size, cfg.intermediate_size),
+            fc2: linear(cfg.intermediate_size, cfg.hidden_size),
+            act: cfg.hidden_act,
+        }
+    }
+
+    fn forward(&self, xs: Tensor<3>) -> Tensor<3> {
+        self.fc2.forward(self.act.forward(self.fc1.forward(xs)))
+    }
+}
+
+/// A layer of the encoder transformer: pre-norm attention and feed-forward branches, each
+/// scaled by a learnt per-channel factor before the residual sum, with layer normalization
+/// where the Qwen3 stacks have RMS normalization.
+#[derive(Module, Debug)]
+struct EncoderLayer {
+    self_attn: Attention,
+    mlp: EncoderMlp,
+    input_layernorm: LayerNorm,
+    post_attention_layernorm: LayerNorm,
+    self_attn_layer_scale: LayerScale,
+    mlp_layer_scale: LayerScale,
+}
+
+impl EncoderLayer {
+    fn init(cfg: &EncoderConfig, attention: &TransformerConfig, device: &Device) -> Self {
+        let norm = || {
+            LayerNormConfig::new(cfg.hidden_size)
+                .with_epsilon(cfg.norm_eps)
+                .init(device)
+        };
+        Self {
+            self_attn: Attention::init(attention, device),
+            mlp: EncoderMlp::init(cfg, device),
+            input_layernorm: norm(),
+            post_attention_layernorm: norm(),
+            self_attn_layer_scale: LayerScale::init(cfg.hidden_size, device),
+            mlp_layer_scale: LayerScale::init(cfg.hidden_size, device),
+        }
+    }
+
+    fn forward(
+        &self,
+        xs: Tensor<3>,
+        mask: Option<&Tensor<4, Bool>>,
+        rotary: &RotarySlice,
+        cache: &mut KvCache,
+    ) -> Tensor<3> {
+        let hidden = self.self_attn.forward(
+            self.input_layernorm.forward(xs.clone()),
+            mask,
+            rotary,
+            cache,
+            Step::Static { offset: 0 },
+        );
+        let xs = xs + self.self_attn_layer_scale.forward(hidden);
+        let hidden = self
+            .mlp
+            .forward(self.post_attention_layernorm.forward(xs.clone()));
+        xs + self.mlp_layer_scale.forward(hidden)
+    }
+}
+
+/// The transformer between the convolutional stack and the quantizer. Causal, and every frame
+/// attends to the `sliding_window` most recent ones, itself included, as in the reference
+/// `MimiModel`.
+#[derive(Module, Debug)]
+struct EncoderTransformer {
+    layers: Vec<EncoderLayer>,
+}
+
+impl EncoderTransformer {
+    fn init(cfg: &EncoderConfig, device: &Device) -> Self {
+        let attention = cfg.transformer_config();
+        Self {
+            layers: (0..cfg.num_hidden_layers)
+                .map(|_| EncoderLayer::init(cfg, &attention, device))
+                .collect(),
+        }
+    }
+
+    /// `xs` (B, hidden_size, frames) in the layout of the convolutions, returned the same way.
+    fn forward(&self, xs: Tensor<3>, state: &mut TransformerState) -> Tensor<3> {
+        state.reset();
+        let mut xs = xs.swap_dims(1, 2);
+        let seq_len = xs.dims()[1];
+        let (mask, rotary, caches) = state.step(seq_len, 0);
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+            xs = layer.forward(xs, mask.as_ref(), &rotary, cache);
+        }
+        xs.swap_dims(1, 2)
+    }
+}
+
+/// The encoding half of a residual vector quantizer: an input projection and the codebooks.
+/// Every codebook quantizes what the previous ones left, to its nearest entry.
+#[derive(Module, Debug)]
+struct RvqEncoder {
+    input_proj: Conv1d,
+    codebooks: Vec<Codebook>,
+}
+
+impl RvqEncoder {
+    fn init(
+        num_quantizers: usize,
+        codebook_size: usize,
+        input_dim: usize,
+        dim: usize,
+        device: &Device,
+    ) -> Self {
+        Self {
+            input_proj: Conv1dConfig::new(input_dim, dim, 1)
+                .with_bias(false)
+                .init(device),
+            codebooks: (0..num_quantizers)
+                .map(|_| Codebook::init(codebook_size, dim, device))
+                .collect(),
+        }
+    }
+
+    /// The codes of `xs` (1, input_dim, frames): one row of `frames` codes per codebook.
+    ///
+    /// The projection runs on the device; the nearest-neighbour search runs on the host, one
+    /// frame at a time in f32: a few million multiply-adds per second of audio, once per voice,
+    /// and exact where a matmul on the device would round its products through tf32.
+    fn encode(&self, xs: Tensor<3>) -> Vec<Vec<u32>> {
+        let projected = self.input_proj.forward(xs);
+        let [_, dim, frames] = projected.dims();
+        let mut residuals = projected
+            .swap_dims(1, 2)
+            .reshape([frames, dim])
+            .into_data()
+            .try_to_vec::<f32>()
+            .expect("the latents are f32");
+        let mut codes = Vec::with_capacity(self.codebooks.len());
+        for codebook in self.codebooks.iter() {
+            let entries = codebook.entries();
+            let mut layer = Vec::with_capacity(frames);
+            for residual in residuals.chunks_exact_mut(dim) {
+                let code = nearest(residual, &entries, dim);
+                let entry = &entries[code * dim..(code + 1) * dim];
+                for (r, e) in residual.iter_mut().zip(entry) {
+                    *r -= e;
+                }
+                layer.push(code as u32);
+            }
+            codes.push(layer);
+        }
+        codes
+    }
+}
+
+/// The index of the row of `entries` (rows of `dim`) closest to `xs` in Euclidean distance.
+fn nearest(xs: &[f32], entries: &[f32], dim: usize) -> usize {
+    let mut best = 0;
+    let mut best_dist = f32::INFINITY;
+    for (index, entry) in entries.chunks_exact(dim).enumerate() {
+        let dist: f32 = xs.iter().zip(entry).map(|(x, e)| (x - e) * (x - e)).sum();
+        if dist < best_dist {
+            best_dist = dist;
+            best = index;
+        }
+    }
+    best
+}
+
+/// The split residual vector quantizer of the encoder: the semantic codebook and the acoustic
+/// ones both quantize the same latents, side by side rather than one after the other.
+#[derive(Module, Debug)]
+struct SplitRvqEncoder {
+    semantic_residual_vector_quantizer: RvqEncoder,
+    acoustic_residual_vector_quantizer: RvqEncoder,
+}
+
+impl SplitRvqEncoder {
+    fn init(cfg: &EncoderConfig, num_quantizers: usize, device: &Device) -> Self {
+        let rvq = |num_quantizers| {
+            RvqEncoder::init(
+                num_quantizers,
+                cfg.codebook_size,
+                cfg.hidden_size,
+                cfg.codebook_dim,
+                device,
+            )
+        };
+        Self {
+            semantic_residual_vector_quantizer: rvq(cfg.num_semantic_quantizers),
+            acoustic_residual_vector_quantizer: rvq(num_quantizers - cfg.num_semantic_quantizers),
+        }
+    }
+
+    /// The codes of `xs` (1, hidden_size, frames), laid out frame by frame.
+    fn encode(&self, xs: Tensor<3>) -> Vec<u32> {
+        let mut layers = self.semantic_residual_vector_quantizer.encode(xs.clone());
+        layers.extend(self.acoustic_residual_vector_quantizer.encode(xs));
+        let frames = layers.first().map_or(0, |layer| layer.len());
+        let mut codes = Vec::with_capacity(frames * layers.len());
+        for frame in 0..frames {
+            codes.extend(layers.iter().map(|layer| layer[frame]));
+        }
+        codes
+    }
+}
+
+/// The speech-tokenizer encoder, the `encoder.` prefix of `speech_tokenizer/model.safetensors`.
+///
+/// A SEANet stack takes the 24 kHz samples to 25 Hz latents, a transformer refines them, a
+/// strided convolution halves their rate to the 12.5 Hz of the codes and a split residual vector
+/// quantizer turns every frame into its codes.
+#[derive(Module, Debug)]
+pub struct Encoder {
+    encoder: SeaNetEncoder,
+    encoder_transformer: EncoderTransformer,
+    /// Only there when the transformer runs at a higher rate than the codes.
+    downsample: Option<CausalConv1d>,
+    quantizer: SplitRvqEncoder,
+    num_quantizers: usize,
+    /// Audio samples per frame of codes.
+    downsample_rate: usize,
+}
+
+impl Encoder {
+    fn init(cfg: &SpeechTokenizerConfig, device: &Device) -> Result<Self, String> {
+        let ecfg = &cfg.encoder_config;
+        if !ecfg.use_causal_conv {
+            return Err("the encoder only supports causal convolutions".to_string());
+        }
+        if ecfg.pad_mode != "constant" {
+            return Err(format!("unsupported encoder pad mode {:?}", ecfg.pad_mode));
+        }
+        if ecfg.use_conv_shortcut {
+            return Err(
+                "the encoder's residual units with a convolution shortcut are not supported"
+                    .to_string(),
+            );
+        }
+        if ecfg.codebook_dim != ecfg.vector_quantization_hidden_dimension {
+            return Err(format!(
+                "the codebook dim {} and the quantization dim {} should match",
+                ecfg.codebook_dim, ecfg.vector_quantization_hidden_dimension
+            ));
+        }
+        if ecfg.head_dim() * ecfg.num_attention_heads != ecfg.hidden_size {
+            return Err(format!("unsupported encoder head dim {}", ecfg.head_dim()));
+        }
+        let num_quantizers = cfg.encoder_valid_num_quantizers;
+        if num_quantizers < ecfg.num_semantic_quantizers || num_quantizers > ecfg.num_quantizers {
+            return Err(format!(
+                "the number of quantizers should be in {}..={}, got {num_quantizers}",
+                ecfg.num_semantic_quantizers, ecfg.num_quantizers
+            ));
+        }
+        // The convolutional stack runs at 25 Hz, the codes at 12.5 Hz.
+        let stride = ecfg.conv_frame_rate() / ecfg.frame_rate;
+        if stride < 1. || stride.fract() != 0. {
+            return Err(format!(
+                "the frame rate {} should divide the rate of the convolutions {}",
+                ecfg.frame_rate,
+                ecfg.conv_frame_rate()
+            ));
+        }
+        let stride = stride as usize;
+        let downsample = (stride > 1).then(|| {
+            let config = Conv1dConfig::new(ecfg.hidden_size, ecfg.hidden_size, 2 * stride)
+                .with_stride(stride)
+                .with_bias(false);
+            CausalConv1d::from_config(config, true, device)
+        });
+        Ok(Self {
+            encoder: SeaNetEncoder::init(ecfg, device),
+            encoder_transformer: EncoderTransformer::init(ecfg, device),
+            downsample,
+            quantizer: SplitRvqEncoder::init(ecfg, num_quantizers, device),
+            num_quantizers,
+            downsample_rate: cfg.encode_downsample_rate,
+        })
+    }
+
+    /// The codes of `pcm`, mono samples at the input sample rate: one frame of `num_quantizers`
+    /// codes per `downsample_rate` samples, the last one included when incomplete.
+    fn encode(&self, pcm: &[f32], state: &mut TransformerState, device: &Device) -> Vec<u32> {
+        let len = pcm.len();
+        let xs = Tensor::<3>::from_data(TensorData::new(pcm.to_vec(), [1, 1, len]), device);
+        let xs = self.encoder.forward(xs);
+        let xs = self.encoder_transformer.forward(xs, state);
+        let xs = match &self.downsample {
+            Some(downsample) => downsample.forward(xs),
+            None => xs,
+        };
+        let mut codes = self.quantizer.encode(xs);
+        let frames = usize::min(
+            len.div_ceil(self.downsample_rate),
+            codes.len() / self.num_quantizers,
+        );
+        codes.truncate(frames * self.num_quantizers);
+        codes
+    }
+}
+
 /// The root of `speech_tokenizer/model.safetensors`.
 #[derive(Module, Debug)]
 pub struct SpeechTokenizerModel {
     decoder: Decoder,
+    encoder: Option<Encoder>,
 }
 
-/// The speech tokenizer together with the state its transformer needs.
+/// The speech tokenizer together with the state its transformers need.
 #[derive(Debug)]
 pub struct SpeechTokenizer {
     model: SpeechTokenizerModel,
     state: TransformerState,
+    encoder_state: Option<TransformerState>,
     config: SpeechTokenizerConfig,
     device: Device,
 }
@@ -503,28 +990,76 @@ impl SpeechTokenizer {
         weights: &std::path::Path,
         device: &Device,
     ) -> Result<Self, String> {
+        Self::load_with(cfg, weights, device, false)
+    }
+
+    /// Loads the encoder as well as the decoder, for [`encode`](Self::encode).
+    pub fn load_with_encoder(
+        cfg: &SpeechTokenizerConfig,
+        weights: &std::path::Path,
+        device: &Device,
+    ) -> Result<Self, String> {
+        Self::load_with(cfg, weights, device, true)
+    }
+
+    fn load_with(
+        cfg: &SpeechTokenizerConfig,
+        weights: &std::path::Path,
+        device: &Device,
+        with_encoder: bool,
+    ) -> Result<Self, String> {
         let decoder_cfg = &cfg.decoder_config;
+        let encoder = with_encoder
+            .then(|| Encoder::init(cfg, device))
+            .transpose()?;
         let mut model = SpeechTokenizerModel {
             decoder: Decoder::init(decoder_cfg, device),
+            encoder,
         };
         let mut store = SafetensorsStore::from_file(weights)
             .with_from_adapter(crate::CheckpointAdapter)
-            .remap(remapper(decoder_cfg)?)
+            .remap(remapper(cfg)?)
             .allow_partial(true);
         let result = model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load {}: {err}", weights.display()))?;
         crate::check_apply_result("speech tokenizer", &result)?;
+        let f32 = burn::tensor::DType::F32;
         Ok(Self {
             model,
-            state: TransformerState::new(
-                &decoder_cfg.transformer_config(),
-                burn::tensor::DType::F32,
-                device,
-            ),
+            state: TransformerState::new(&decoder_cfg.transformer_config(), f32, device),
+            encoder_state: with_encoder.then(|| {
+                TransformerState::new(&cfg.encoder_config.transformer_config(), f32, device)
+            }),
             config: cfg.clone(),
             device: device.clone(),
         })
+    }
+
+    /// Whether the encoder was loaded, see [`load_with_encoder`](Self::load_with_encoder).
+    pub fn has_encoder(&self) -> bool {
+        self.model.encoder.is_some()
+    }
+
+    /// The sample rate [`encode`](Self::encode) expects.
+    pub fn input_sample_rate(&self) -> usize {
+        self.config.input_sample_rate
+    }
+
+    /// Encodes `pcm`, mono samples at [`input_sample_rate`](Self::input_sample_rate), into
+    /// codes laid out frame by frame, `num_code_groups` per frame, as [`decode`](Self::decode)
+    /// takes them: one frame per `encode_downsample_rate` samples, the last one included when
+    /// incomplete. Needs [`load_with_encoder`](Self::load_with_encoder).
+    pub fn encode(&mut self, pcm: &[f32]) -> Result<Vec<u32>, String> {
+        let (Some(encoder), Some(state)) = (&self.model.encoder, &mut self.encoder_state) else {
+            return Err(
+                "the encoder was not loaded, use SpeechTokenizer::load_with_encoder".to_string(),
+            );
+        };
+        if pcm.is_empty() {
+            return Err("the recording to encode is empty".to_string());
+        }
+        Ok(encoder.encode(pcm, state, &self.device))
     }
 
     pub fn output_sample_rate(&self) -> usize {
@@ -632,7 +1167,9 @@ impl SpeechTokenizer {
 }
 
 /// Maps the names of the checkpoint onto the module tree above.
-fn remapper(cfg: &DecoderConfig) -> Result<KeyRemapper, String> {
+fn remapper(cfg: &SpeechTokenizerConfig) -> Result<KeyRemapper, String> {
+    let ecfg = &cfg.encoder_config;
+    let cfg = &cfg.decoder_config;
     let mut patterns = vec![
         // The codebooks are nested one level deeper in the checkpoint.
         (
@@ -682,5 +1219,72 @@ fn remapper(cfg: &DecoderConfig) -> Result<KeyRemapper, String> {
         format!(r"^decoder\.decoder\.{}\.", n + 2),
         "decoder.vocoder.final_conv.".to_string(),
     ));
+
+    // The encoder's codebooks are the decoder's module under other names.
+    patterns.push((
+        r"^encoder\.quantizer\.(\w+)\.layers\.(\d+)\.codebook\.embed_sum$".to_string(),
+        "encoder.quantizer.$1.codebooks.$2.embedding_sum".to_string(),
+    ));
+    patterns.push((
+        r"^encoder\.quantizer\.(\w+)\.layers\.(\d+)\.codebook\.".to_string(),
+        "encoder.quantizer.$1.codebooks.$2.".to_string(),
+    ));
+    // The SEANet stack is one `nn.Sequential`: the first convolution, then per stage the
+    // residual units (themselves sequences of ELU, convolution, ELU, convolution), an ELU and
+    // the strided convolution, and at the end an ELU and the last convolution. The activations
+    // take an index without holding parameters.
+    let seanet = |index: usize| format!(r"^encoder\.encoder\.layers\.{index}\.");
+    patterns.push((seanet(0), "encoder.encoder.init_conv.".to_string()));
+    let per_stage = ecfg.num_residual_layers + 2;
+    for stage in 0..ecfg.upsampling_ratios.len() {
+        let first = 1 + stage * per_stage;
+        for residual in 0..ecfg.num_residual_layers {
+            let prefix = format!("encoder.encoder.stages.{stage}.residuals.{residual}.");
+            for (conv, block) in [("conv1", 1), ("conv2", 3)] {
+                patterns.push((
+                    format!("{}block\\.{block}\\.", seanet(first + residual)),
+                    format!("{prefix}{conv}."),
+                ));
+            }
+        }
+        patterns.push((
+            seanet(first + ecfg.num_residual_layers + 1),
+            format!("encoder.encoder.stages.{stage}.downsample."),
+        ));
+    }
+    patterns.push((
+        seanet(1 + ecfg.upsampling_ratios.len() * per_stage + 1),
+        "encoder.encoder.final_conv.".to_string(),
+    ));
     KeyRemapper::from_patterns(patterns).map_err(|err| format!("invalid remapping: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nearest_picks_the_closest_entry() {
+        // Four entries of two values.
+        let entries = [0., 0., 1., 0., 0., 1., 1., 1.];
+        assert_eq!(nearest(&[0.9, 0.1], &entries, 2), 1);
+        assert_eq!(nearest(&[0.4, 0.6], &entries, 2), 2);
+        assert_eq!(nearest(&[2., 2.], &entries, 2), 3);
+        // A tie goes to the first entry.
+        assert_eq!(nearest(&[0.5, 0.5], &entries, 2), 0);
+    }
+
+    #[test]
+    fn codebook_entries_are_the_sums_divided_by_the_usage() {
+        let device = crate::test_device();
+        let codebook = Codebook {
+            embedding_sum: Param::from_tensor(Tensor::from_data([[2., 4.], [3., 0.]], &device)),
+            cluster_usage: Param::from_tensor(Tensor::from_data([2., 0.], &device)),
+        };
+        let entries = codebook.entries();
+        assert_eq!(&entries[..2], &[1., 2.]);
+        // A never used entry is divided by the floor of the usage rather than by zero.
+        assert!((entries[2] - 3e5).abs() < 1., "{}", entries[2]);
+        assert_eq!(entries[3], 0.);
+    }
 }
