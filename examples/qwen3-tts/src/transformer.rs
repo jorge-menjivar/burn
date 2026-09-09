@@ -1,5 +1,6 @@
 //! Decoder-only transformer shared by the Qwen3-TTS talker, its code predictor and the
-//! speech-tokenizer decoder.
+//! speech-tokenizer decoder. The speech-tokenizer encoder borrows its attention layer, see
+//! [`Attention`].
 //!
 //! The three stacks are all Qwen3-style (pre-norm, SwiGLU MLP, RoPE, grouped-query attention)
 //! and only differ in a few knobs captured by [`TransformerConfig`]: whether queries/keys get a
@@ -240,7 +241,7 @@ impl KvCache {
 
 /// Where a forward pass puts its tokens in the cache and how far it attends.
 #[derive(Clone, Copy)]
-enum Step<'a> {
+pub(crate) enum Step<'a> {
     /// Tokens at `offset..offset + L`, decided when the pass is built.
     Static { offset: usize },
     /// One token at the position held by `pos`, attending to the whole fixed cache through the
@@ -351,6 +352,18 @@ impl TransformerState {
         self.dtype
     }
 
+    /// What a forward pass over `seq_len` tokens starting at `offset` takes from the state: the
+    /// attention mask, the rotary rows of its positions and the per-layer caches.
+    pub(crate) fn step(
+        &mut self,
+        seq_len: usize,
+        offset: usize,
+    ) -> (Option<Tensor<4, Bool>>, RotarySlice, &mut [KvCache]) {
+        let mask = self.attention_mask(seq_len, offset);
+        let rotary = self.rotary_emb.slice(offset, seq_len);
+        (mask, rotary, self.caches.as_mut_slice())
+    }
+
     /// Additive attention mask of shape (1, 1, seq_len, offset + seq_len), `-inf` on the
     /// positions a query must not attend to.
     ///
@@ -422,7 +435,7 @@ fn repeat_kv(xs: Tensor<4>, n_rep: usize) -> Tensor<4> {
 }
 
 #[derive(Module, Debug)]
-struct Attention {
+pub(crate) struct Attention {
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
@@ -436,7 +449,7 @@ struct Attention {
 }
 
 impl Attention {
-    fn init(cfg: &TransformerConfig, device: &Device) -> Self {
+    pub(crate) fn init(cfg: &TransformerConfig, device: &Device) -> Self {
         let head_dim = cfg.head_dim;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
@@ -466,7 +479,7 @@ impl Attention {
         }
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: Tensor<3>,
         mask: Option<&Tensor<4, Bool>>,
@@ -559,18 +572,18 @@ impl Attention {
 
 /// Learnt per-channel scaling of a residual branch.
 #[derive(Module, Debug)]
-struct LayerScale {
+pub(crate) struct LayerScale {
     scale: Param<Tensor<1>>,
 }
 
 impl LayerScale {
-    fn init(size: usize, device: &Device) -> Self {
+    pub(crate) fn init(size: usize, device: &Device) -> Self {
         Self {
             scale: Param::from_tensor(Tensor::ones([size], device)),
         }
     }
 
-    fn forward(&self, xs: Tensor<3>) -> Tensor<3> {
+    pub(crate) fn forward(&self, xs: Tensor<3>) -> Tensor<3> {
         xs * self.scale.val().unsqueeze()
     }
 }

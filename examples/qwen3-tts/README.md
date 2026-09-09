@@ -47,6 +47,8 @@ Pick the backend with a feature: `cuda`, `rocm`, `metal`, `vulkan`, `wgpu`, `cpu
 | `0.6b-custom-voice`  | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`   |
 | `1.7b-custom-voice`  | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`   |
 | `1.7b-voice-design`  | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`   |
+| `0.6b-base`          | `Qwen/Qwen3-TTS-12Hz-0.6B-Base`          |
+| `1.7b-base`          | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`          |
 
 The CustomVoice checkpoints ship a set of speakers, listed together with the supported languages
 by `--list-speakers`. Two of them, `eric` and `dylan`, are dialect speakers: they switch the
@@ -65,8 +67,25 @@ cargo run --release -p qwen3-tts --features cuda -- --which 1.7b-voice-design \
     --text "Once upon a time, in a village at the edge of a forest."
 ```
 
-The `Base` checkpoints clone a voice from a recording. They need the speaker encoder and the
-encoder of the speech tokenizer, which are not part of this example.
+The Base checkpoints clone a voice from a recording: a wav file with a few seconds of speech,
+at any sample rate, mono or not. The speaker encoder the checkpoint ships turns it into an
+embedding that conditions the talker the way a predefined speaker does. With the transcript of
+the recording the clone gets closer: the recording is also turned into codec tokens by the
+encoder of the speech tokenizer and fed to the talker as an in-context example, so the talker
+continues the recording with the text, in its voice. The reference implementation streams the
+text when cloning, one token per frame; `--non-streaming-text` puts it all in the prefix
+instead.
+
+```bash
+cargo run --release -p qwen3-tts --features cuda -- --which 0.6b-base \
+    --ref-audio voice.wav --ref-text "What the recording says." \
+    --text "Hello there, this is a test of voice cloning with burn."
+```
+
+Without `--ref-text` only the speaker embedding is used. The 1.7B Base checkpoint takes the same
+flags. Turning a 7.7 s recording into its embedding and codes takes 0.7 s on an RTX 3090 once
+the kernels are compiled, 0.1 s of it for the embedding alone; the nearest-codebook search of
+the codes runs on the host, in exact f32.
 
 ## Performance
 
@@ -271,6 +290,18 @@ first near-tie in the code predictor is decided differently by the two sets of k
 Burn's accelerated matmul kernels read f32 inputs as TF32 on tensor cores, so `--dtype f32` is
 only exact where the plain kernels are picked, as they are for the single-row products of the
 column-major linear layers.
+
+`--ref-file` writes what a voice clone starts from, the speaker embedding and the codes of the
+reference recording, as a JSON object. Against the candle port of the same models, on a 7.7 s
+recording: the embedding agrees to a relative error of 2e-4 in f32, the greedy generation from
+the embedding alone is identical frame for frame, and the greedy generation from the in-context
+example is identical for 399 of 400 frames. The codes of the recording are integers, so they
+either match or not: on the CPU backend (`--cpu`) all 1536 of them do, while on the GPU 130
+differ, none in the first codebook and more in each deeper one, because the encoder's matmuls
+round through TF32 and the residual a deep codebook quantizes is small. The generation above was
+run with the GPU codes. One difference from the candle port is deliberate: the encoder's
+transformer attends to at most 250 frames, 10 s of audio, as `transformers` does; candle attends
+to the whole recording, so the two only agree on recordings under 10 s.
 
 ## Sampling
 
