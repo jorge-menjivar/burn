@@ -90,7 +90,16 @@ impl<B: FusionBackend> Backend for Fusion<B> {
     }
 
     fn memory_cleanup(device: &Self::Device) {
-        B::memory_cleanup(device)
+        // A dropped tensor is registered as an operation on its stream, and its
+        // memory only returns to the pool once the stream runs it. The cleanup
+        // releases free pages, so it has to come after that, or the pages of
+        // everything dropped since the last drain still look occupied and are
+        // kept. `sync` drains the calling stream first, as for the pool
+        // installation below; other streams keep whatever they have queued.
+        let client = GlobalFusionClient::<B::FusionRuntime>::load(device);
+        let device = device.clone();
+
+        client.sync(move || B::memory_cleanup(&device))
     }
 
     fn memory_install_pools(

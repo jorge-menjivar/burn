@@ -1027,4 +1027,45 @@ mod fusion {
             );
         });
     }
+
+    /// `memory_cleanup` releases the pages of tensors dropped just before it.
+    ///
+    /// Dropping a fusion tensor only queues a drop operation on its stream: the
+    /// memory returns to the pool when the queue runs. A cleanup that does not
+    /// drain the queue first finds those pages still occupied and keeps them —
+    /// and nothing cleans up once the queue has run.
+    #[test]
+    #[serial]
+    fn memory_cleanup_releases_tensors_dropped_just_before() {
+        let stream = test_stream();
+        stream.executes(|| {
+            let device: Device = Default::default();
+            const TENSOR_BYTES: u64 = 2048 * 2048 * 4;
+            let reserved = |device: &Device| device.memory_pool_usage().unwrap().bytes_reserved;
+
+            device.memory_cleanup();
+            let before = reserved(&device);
+
+            let a = TestTensor::<2>::ones([2048, 2048], &device);
+            let b = (a.clone() + 1.0) * 2.0;
+            let _ = b.clone().into_data();
+            let during = reserved(&device);
+            assert!(
+                during >= before + TENSOR_BYTES,
+                "the tensors should hold pages of their own, or this tests nothing: \
+                 {before} bytes reserved before them, {during} with them",
+            );
+
+            drop(a);
+            drop(b);
+            device.memory_cleanup();
+            let after = reserved(&device);
+
+            assert!(
+                after < before + TENSOR_BYTES,
+                "the cleanup should release the dropped tensors' pages: {before} bytes \
+                 reserved before them, {during} with them, {after} after the cleanup",
+            );
+        });
+    }
 }
