@@ -273,3 +273,54 @@ fn repeated_consuming_updates_alias_with_cached_plan() {
         );
     });
 }
+
+/// A read is a snapshot of the tensor as it was when read, whatever runs afterwards.
+///
+/// The operation after the read below is the tensor's last use, so its fused kernel writes
+/// its output into the tensor's own buffer — the buffer the read came from. A read that
+/// defers its device-to-host copy until the bytes are first accessed copies that output
+/// instead of the values it was asked for.
+#[test]
+fn read_data_is_not_changed_by_a_later_inplace_consumer() {
+    let stream = test_stream();
+    stream.executes(|| {
+        let device = Default::default();
+        // Element-wise chains, as in the tests above: a chain is a fused block, which is
+        // what writes in place.
+        let run = |tensor: TestTensor<2>| {
+            let tensor = tensor.add_scalar(0.0).mul_scalar(2.0);
+            let read = tensor.clone().into_data();
+            let consumed = tensor.add_scalar(100.0).mul_scalar(1.0).into_data();
+            (read, consumed)
+        };
+
+        // Warmup with the same graph: the first execution may autotune on forked contexts,
+        // which never alias.
+        let _ = run(TestTensor::<2>::from_data(
+            [[1.0, 2.0], [3.0, 4.0]],
+            &device,
+        ));
+        device.sync().unwrap();
+
+        let before = inplace_alias_count();
+        let (read, consumed) = run(TestTensor::<2>::from_data(
+            [[1.0, 2.0], [3.0, 4.0]],
+            &device,
+        ));
+        device.sync().unwrap();
+        let after = inplace_alias_count();
+
+        assert!(
+            after > before,
+            "the consumer should write into the read tensor's buffer, or this tests nothing",
+        );
+        consumed.assert_approx_eq::<FloatElem>(
+            &TensorData::from([[102.0, 104.0], [106.0, 108.0]]),
+            Tolerance::default(),
+        );
+        read.assert_approx_eq::<FloatElem>(
+            &TensorData::from([[2.0, 4.0], [6.0, 8.0]]),
+            Tolerance::default(),
+        );
+    });
+}
