@@ -41,17 +41,24 @@ pub(crate) async fn into_data(tensor: CubeTensor) -> Result<TensorData, Executio
     let shape = tensor.meta.shape().clone();
     let strides = tensor.meta.strides().clone();
     let binding = CopyDescriptor::new(tensor.handle.binding(), shape, strides, elem_size);
-    // Under an async runtime (e.g. a remote server), a lazy read defers the device→host
-    // copy to first access, where a blocking read would run on — and starve — an executor
-    // worker. Read eagerly there so the copy happens inside this awaited future. On a
-    // sync/threaded runtime the lazy read keeps the streaming optimization.
-    let read = match burn_std::runtime_kind() {
-        burn_std::RuntimeKind::Async => tensor.client.read_one_tensor_async(binding).await,
-        _ => tensor.client.read_lazy_async(binding).await,
-    };
-    let bytes = read.map_err(|err| ExecutionError::WithContext {
-        reason: format!("{err}"),
-    })?;
+    // Read now, not lazily. The data is a snapshot of the tensor as it is at this call, and
+    // `read_lazy_async` would defer the device→host copy to the first access of the bytes —
+    // which CubeCL documents as sound only for a buffer nothing writes to in between. Here
+    // something usually does: the tensor's next use, fused and in place, writes its output
+    // into this very buffer, since the read's binding keeps the allocation alive without
+    // counting against `can_mut`; and a captured graph replays into its buffers regardless.
+    // The bytes then held whatever that later work left behind.
+    //
+    // What the lazy read bought, a save whose peak host memory is the largest tensor rather
+    // than the model, does not depend on it: burn-store defers the *call* to `into_data`
+    // until its writer reaches each tensor, and drops the bytes before the next.
+    let bytes = tensor
+        .client
+        .read_one_tensor_async(binding)
+        .await
+        .map_err(|err| ExecutionError::WithContext {
+            reason: format!("{err}"),
+        })?;
 
     Ok(TensorData::from_bytes(
         bytes,
