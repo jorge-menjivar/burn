@@ -114,6 +114,85 @@ pub fn conv_im2col_1x1<const N: usize>(
     Ok(out)
 }
 
+/// A dense convolution as one matmul over its input's columns:
+/// `[m, ..kernel * c_in] @ [..kernel * c_in, c_out]`, with `m` the output
+/// pixels of every batch.
+///
+/// For a kernel larger than one pixel, the only candidates that do not need
+/// accelerated tiles are this and `conv_direct`, so a dtype with none — any on
+/// a device without matrix units, f32 on most that have them — used to get the
+/// direct kernel alone. That kernel does not tile the contraction, and it slows
+/// as the contraction grows: on an AMD BC-250 over Vulkan, which has no
+/// cooperative matrices, a kernel-7 conv1d ran at 90 GFLOPS over 192 channels,
+/// 37 over 768 and 19 over 1024 into 1536, where transposed convolutions of the
+/// same size ran at about 940.
+///
+/// The cost is the materialisation: see [`im2col`]. That is the trade this
+/// makes, and why it is offered to autotune rather than taken as a rule.
+pub fn conv_im2col<const N: usize>(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    options: ConvOptions<N>,
+) -> Result<CubeTensor, ConvSetupError> {
+    let rank = input.meta.num_dims();
+    let dim_c = rank - 1;
+
+    // Both declines read fields the autotune key holds exactly, as in
+    // `wgrad_im2col`.
+    if options.groups != 1 {
+        return Err(ConvSetupError::Groups(options.groups));
+    }
+    // A pointwise convolution's columns are its input: `conv_im2col_1x1` runs
+    // the same matmul without copying them.
+    if check_pointwise_strided(&weight.meta.shape()[1..dim_c], &options).is_ok() {
+        return Err(ConvSetupError::Unknown);
+    }
+
+    let batch = input.meta.shape()[0];
+    let in_channels = input.meta.shape()[dim_c];
+    let out_channels = weight.meta.shape()[0];
+    let kernel_shape = weight.meta.shape()[1..dim_c].to_vec();
+
+    let out_shape = calculate_conv_output_sizes(
+        &kernel_shape,
+        &options.stride,
+        &options.padding,
+        &options.dilation,
+        &input.meta.shape()[1..dim_c],
+    );
+
+    let cols = kernel_shape.iter().product::<usize>() * in_channels;
+    let rows = batch * out_shape.iter().product::<usize>();
+
+    let columns = im2col::<N>(input, &out_shape, &kernel_shape, &options);
+    // `[batch, ..out spatial, cols]` -> `[m, cols]`. Free: only leading
+    // dimensions merge, and they are dense in that order.
+    let columns = reshape(columns, Shape::new([rows, cols]));
+    let dtype = columns.dtype;
+
+    // `[c_out, ..kernel, c_in]` -> `[c_out, cols]`, the order the columns were
+    // laid out in. Then `[cols, c_out]` as a view, K-major on both sides as in
+    // `conv_im2col_1x1`.
+    let weight = swap_dims(reshape(weight, Shape::new([out_channels, cols])), 0, 1);
+
+    let out = matmul(columns, weight, None, MatmulStrategy::default(), dtype)?; // [m, c_out]
+
+    // Skip reshape to avoid potential `into_contiguous`. We're only splitting dims so it's safe.
+    let mut split_m = vec![batch];
+    split_m.extend(out_shape.iter().copied());
+    let mut out = split_dim(out, 0, &split_m); // [batch, ..out spatial, c_out]
+
+    if let Some(bias) = bias {
+        let mut bias_shape = iter::repeat_n(1, rank - 1).collect::<Vec<_>>();
+        bias_shape.push(out_channels);
+        let bias = reshape(bias, bias_shape.into());
+        out = launch_binop::<AddOp>(out, bias);
+    }
+
+    Ok(out)
+}
+
 /// Reshapes NHWC input to [(N, H, W), C]
 fn reshape_input(input: CubeTensor) -> CubeTensor {
     let input = crate::kernel::untile(input);
