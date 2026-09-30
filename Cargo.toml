@@ -249,11 +249,11 @@ cubek = { git = "https://github.com/tracel-ai/cubek", default-features = false, 
 ### compilation cache on by default and runtime fixes (a lazily coalescing pool, partial batches, CPU reads), rebased on main. ###
 # Replaces the git source everywhere, including for cubek, so that only one cubecl gets built.
 [patch."https://github.com/tracel-ai/cubecl"]
-cubecl = { git = "https://github.com/jorge-menjivar/cubecl", rev = "6324271d770012864491b5e6d22618d1b4d4cb67" }
-cubecl-common = { git = "https://github.com/jorge-menjivar/cubecl", rev = "6324271d770012864491b5e6d22618d1b4d4cb67" }
-cubecl-environment = { git = "https://github.com/jorge-menjivar/cubecl", rev = "6324271d770012864491b5e6d22618d1b4d4cb67" }
-cubecl-ir = { git = "https://github.com/jorge-menjivar/cubecl", rev = "6324271d770012864491b5e6d22618d1b4d4cb67" }
-cubecl-zspace = { git = "https://github.com/jorge-menjivar/cubecl", rev = "6324271d770012864491b5e6d22618d1b4d4cb67" }
+cubecl = { git = "https://github.com/jorge-menjivar/cubecl", rev = "3c20cec0b6f78e20acbd9352f96d2ab2ecceb87e" }
+cubecl-common = { git = "https://github.com/jorge-menjivar/cubecl", rev = "3c20cec0b6f78e20acbd9352f96d2ab2ecceb87e" }
+cubecl-environment = { git = "https://github.com/jorge-menjivar/cubecl", rev = "3c20cec0b6f78e20acbd9352f96d2ab2ecceb87e" }
+cubecl-ir = { git = "https://github.com/jorge-menjivar/cubecl", rev = "3c20cec0b6f78e20acbd9352f96d2ab2ecceb87e" }
+cubecl-zspace = { git = "https://github.com/jorge-menjivar/cubecl", rev = "3c20cec0b6f78e20acbd9352f96d2ab2ecceb87e" }
 
 [profile.dev]
 debug = 1 # Speed up compilation time and not necessary.
